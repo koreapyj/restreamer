@@ -11,6 +11,13 @@
 #   User=hts
 #   Group=hts
 #
+# GPU access: QSV/OpenCL encoding needs /dev/dri/renderD* — postinst adds the
+# 'restreamer' user to the 'render' (and 'video') groups when they exist. If
+# you override User= above, make sure that user is in those groups too, or add
+# under `systemctl edit restreamer`:
+#   [Service]
+#   SupplementaryGroups=render video
+#
 # SECURITY: the daemon's HTTP API is UNAUTHENTICATED by contract — any host
 # that can reach listen.host:listen.port can replace the desired state and
 # thereby start/stop arbitrary tvheadend subscriptions and ffmpeg processes

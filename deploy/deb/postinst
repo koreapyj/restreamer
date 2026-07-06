@@ -21,6 +21,16 @@ case "$1" in
         --home /var/lib/restreamer --no-create-home restreamer
     fi
 
+    # QSV/OpenCL hardware encoding opens /dev/dri/renderD* (group 'render';
+    # some driver stacks gate VA-API paths behind 'video'). Without these the
+    # ffmpeg pipeline dies at device creation (AVERROR_EXTERNAL).
+    for grp in render video; do
+      if getent group "$grp" >/dev/null && \
+         ! id -nG restreamer | tr ' ' '\n' | grep -qx "$grp"; then
+        adduser --quiet restreamer "$grp"
+      fi
+    done
+
     # stateFile default is /var/lib/restreamer/desired.json
     mkdir -p /var/lib/restreamer
     chown restreamer:restreamer /var/lib/restreamer

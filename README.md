@@ -104,6 +104,13 @@ user — grant permissions, or override `User=`/`Group=` with
 `systemctl edit restreamer` (read the SECURITY note in the unit before
 changing the bind address).
 
+GPU access: QSV/OpenCL encoding opens `/dev/dri/renderD*`. postinst adds the
+`restreamer` user to the `render` (and `video`) groups automatically; if
+ffmpeg logs `Device creation failed` / `No device available for decoder`
+(AVERROR_EXTERNAL at QSV init), check `id restreamer` includes `render`, or —
+if you overrode `User=` — add `SupplementaryGroups=render video` via
+`systemctl edit restreamer` and restart.
+
 To build the deb yourself on Linux:
 `pnpm install --frozen-lockfile && bash scripts/build-deb.sh` →
 `out/restreamer_<version>_amd64.deb`.
