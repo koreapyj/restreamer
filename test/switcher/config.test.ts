@@ -34,17 +34,23 @@ describe('loadSwitcherConfig', () => {
       cacheTtlMs: 2000,
       probeIntervalMs: 15_000,
       stallGraceSec: 10,
+      segmentUrls: 'redirect',
     });
   });
 
   it('merges partial overrides with defaults', () => {
     const cfg = loadSwitcherConfig(
-      writeConfig('listen: { port: 6600 }\ncacheTtlMs: 500\nstallGraceSec: 20\n'),
+      writeConfig('listen: { port: 6600 }\ncacheTtlMs: 500\nstallGraceSec: 20\nsegmentUrls: upstream\n'),
     );
     expect(cfg.listen).toEqual({ host: '0.0.0.0', port: 6600 });
     expect(cfg.cacheTtlMs).toBe(500);
     expect(cfg.stallGraceSec).toBe(20);
+    expect(cfg.segmentUrls).toBe('upstream');
     expect(cfg.probeIntervalMs).toBe(15_000); // default, untouched
+  });
+
+  it('rejects an unknown segmentUrls mode', () => {
+    expect(() => loadSwitcherConfig(writeConfig('segmentUrls: proxy\n'))).toThrow(/invalid config/);
   });
 
   it('resolves the config path from $SWITCHER_CONFIG', () => {

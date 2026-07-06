@@ -40,6 +40,11 @@ export const DaemonConfigSchema = Type.Object({
   stateFile: Type.String({ default: '/var/lib/restreamer/desired.json' }),
   /** local tvheadend instance the daemon subscribes to */
   tvhBaseUrl: Type.String({ default: 'http://127.0.0.1:9981' }),
+  /**
+   * local M3U catalog of external (non-tvheadend) sources, exposed via
+   * `GET /v1/sources` (e.g. /etc/restreamer/sources.m3u); null = no catalog
+   */
+  sourcesM3u: Type.Union([Type.String(), Type.Null()], { default: null }),
   /** subscription weight when a session doesn't specify one */
   defaultWeight: Type.Number({ default: 100 }),
   ffmpegPath: Type.String({ default: 'ffmpeg' }),

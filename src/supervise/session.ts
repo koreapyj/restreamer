@@ -27,6 +27,14 @@
  * "subscription refused" from a mid-stream drop); body→tsreadex.stdin,
  * tsreadex.stdout→ffmpeg.stdin, ffmpeg -progress on fd3.
  *
+ * Sessions without an explicit `tsreadex.programNumber`
+ * (pipeline.needsProgramNumber) PAT-probe the source between source-open and
+ * spawn: chunks are buffered losslessly while a PatProbe scans them; on
+ * success tsreadex is spawned with `-n <detected>` prepended and the buffered
+ * prefix is written to its stdin before the body is piped (byte order
+ * preserved). Probe failure (2MiB/10s bound, source end, abort) tears the
+ * generation down as a `crash`.
+ *
  * All public transitions are serialized through a promise-chain mutex.
  * Watchdog-initiated restarts (stall / playlist-lag / oom-guard) tear the
  * generation down and flow through the normal exit path, which classifies
@@ -39,6 +47,7 @@ import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { request as undiciRequest } from 'undici';
 import type { DesiredSession, ExitClass, SessionState, SessionStatus } from '../contract/v1.js';
+import { PatProbe, pickProgram } from '../pipeline/patProbe.js';
 import { type LogEntry, LogRing } from '../util/logRing.js';
 import { backoffDelayMs } from './backoff.js';
 import type {
@@ -62,6 +71,13 @@ export type InternalSessionState =
 
 /** healthy / oom-guard exits restart quickly instead of consulting the backoff schedule */
 export const QUICK_RESTART_MS = 1_000;
+
+/** PAT probe bounds — no PAT within either bound fails the generation (class crash) */
+export const PAT_PROBE_MAX_BYTES = 2 * 1024 * 1024;
+export const PAT_PROBE_TIMEOUT_MS = 10_000;
+
+const PAT_PROBE_FAIL_MSG =
+  'no PAT found in the first 2MiB/10s of the source — cannot derive a program number; set a manual programNumber override';
 
 const RAN_HEALTHY_MS = 60_000;
 const HEALTH_FILE_INTERVAL_MS = 5_000;
@@ -165,6 +181,10 @@ export class Session {
   private memoryRssMb: number | undefined;
   private lastSegmentAt: string | undefined;
   private playlistLagSec: number | undefined;
+  /** PAT-probed program number — kept across restarts until a new probe result */
+  private detectedProgramNumber: number | undefined;
+  /** aborts an in-flight PAT probe (stop() must not wait out the probe timeout) */
+  private probeCancel: (() => void) | undefined;
 
   constructor(init: SessionInit) {
     this.desired = init.desired;
@@ -201,6 +221,9 @@ export class Session {
   /** Graceful stop: abort source → EOF cascade → SIGTERM → SIGKILL. Never throws. */
   stop(): Promise<void> {
     this.wantRunning = false;
+    // a doStart() awaiting the PAT probe holds the mutex — cancel it so the
+    // queued doStop() doesn't wait out the probe timeout
+    this.probeCancel?.();
     return this.enqueue(() => this.doStop());
   }
 
@@ -237,6 +260,7 @@ export class Session {
       memoryRssMb: this.memoryRssMb,
       lastSegmentAt: this.lastSegmentAt,
       playlistLagSec: this.playlistLagSec,
+      detectedProgramNumber: this.detectedProgramNumber,
     };
   }
 
@@ -342,9 +366,34 @@ export class Session {
       return;
     }
 
+    // --- PAT probe (no explicit programNumber) --------------------------------
+    let probedPrefix: Buffer[] | undefined;
+    if (this.pipeline.needsProgramNumber) {
+      const prefix = await this.probePat(gen);
+      if (prefix === null) {
+        gen.abort.abort();
+        gen.body.destroy();
+        this.gen = undefined;
+        if (!this.wantRunning) {
+          this.setState(this.restingState());
+          return;
+        }
+        this.deps.logger.warn(`[${this.name}] ${PAT_PROBE_FAIL_MSG}`);
+        this.lastExit = { code: null, signal: null, at: this.iso(), class: 'crash' };
+        this.lastError = PAT_PROBE_FAIL_MSG;
+        this.scheduleRestart('crash');
+        return;
+      }
+      probedPrefix = prefix;
+    }
+    const tsreadexArgv =
+      probedPrefix !== undefined && this.detectedProgramNumber !== undefined
+        ? ['-n', String(this.detectedProgramNumber), ...this.pipeline.tsreadexArgv]
+        : this.pipeline.tsreadexArgv;
+
     // --- spawn children -------------------------------------------------------
     try {
-      gen.tsreadex = this.deps.spawnImpl(this.settings.tsreadexPath, this.pipeline.tsreadexArgv, {
+      gen.tsreadex = this.deps.spawnImpl(this.settings.tsreadexPath, tsreadexArgv, {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       gen.ffmpeg = this.deps.spawnImpl(this.settings.ffmpegPath, this.pipeline.ffmpegArgv, {
@@ -363,12 +412,63 @@ export class Session {
       return;
     }
 
-    this.wireGeneration(gen);
+    this.wireGeneration(gen, probedPrefix);
     this.setState('running');
     this.startWatchdogs(gen);
   }
 
-  private wireGeneration(gen: Generation): void {
+  /**
+   * Buffer source chunks (losslessly) while scanning for a PAT. Resolves with
+   * the buffered prefix on success — `detectedProgramNumber` updated and the
+   * body paused, ready to be piped after the prefix — or null on failure
+   * (byte/time bound, source end/error, abort, stop()). All listeners and the
+   * timeout are detached before resolving; the caller owns the teardown.
+   */
+  private probePat(gen: Generation): Promise<Buffer[] | null> {
+    const body = gen.body as Readable;
+    const probe = new PatProbe();
+    const buffered: Buffer[] = [];
+    const t = this.deps.timers;
+    body.on('error', () => undefined); // never let a probe-window error go unhandled
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeout: unknown;
+      const finish = (result: Buffer[] | null): void => {
+        if (settled) return;
+        settled = true;
+        body.off('data', onData);
+        body.off('end', onEndOrError);
+        body.off('close', onEndOrError);
+        body.off('error', onEndOrError);
+        gen.abort.signal.removeEventListener('abort', onAbort);
+        if (timeout !== undefined) t.clearTimeout(timeout);
+        this.probeCancel = undefined;
+        body.pause();
+        resolve(result);
+      };
+      const onData = (chunk: Buffer): void => {
+        buffered.push(chunk);
+        const programs = probe.feed(chunk);
+        if (programs !== null) {
+          this.detectedProgramNumber = pickProgram(programs, this.deps.logger, this.name);
+          finish(buffered);
+          return;
+        }
+        if (probe.bytesConsumed >= PAT_PROBE_MAX_BYTES) finish(null);
+      };
+      const onEndOrError = (): void => finish(null);
+      const onAbort = (): void => finish(null);
+      this.probeCancel = () => finish(null);
+      timeout = t.setTimeout(() => finish(null), PAT_PROBE_TIMEOUT_MS);
+      gen.abort.signal.addEventListener('abort', onAbort);
+      body.on('data', onData);
+      body.on('end', onEndOrError);
+      body.on('close', onEndOrError);
+      body.on('error', onEndOrError);
+    });
+  }
+
+  private wireGeneration(gen: Generation, probedPrefix?: Buffer[]): void {
     const body = gen.body as Readable;
     const tsreadex = gen.tsreadex as ChildHandle;
     const ffmpeg = gen.ffmpeg as ChildHandle;
@@ -382,6 +482,11 @@ export class Session {
 
     if (tsreadex.stdin) {
       tsreadex.stdin.on('error', () => undefined);
+      // probed bytes first, then the live body — byte order preserved (the
+      // body was paused by the probe; pipe() resumes it)
+      if (probedPrefix) {
+        for (const chunk of probedPrefix) tsreadex.stdin.write(chunk);
+      }
       body.pipe(tsreadex.stdin);
     }
     if (ffmpeg.stdin) {

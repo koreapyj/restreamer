@@ -8,9 +8,14 @@ import { describe, expect, it } from 'vitest';
 import {
   DesiredState,
   RESTREAMER_API_VERSION,
+  SessionStatus,
+  SourceCatalogEntry,
+  SourcesResponse,
+  StatusResponse,
   SwitchCommand,
   SwitcherDesiredState,
   type DesiredState as DesiredStateT,
+  type StatusResponse as StatusResponseT,
   type SwitcherDesiredState as SwitcherDesiredStateT,
 } from '../src/contract/v1.js';
 
@@ -114,10 +119,17 @@ describe('DesiredState', () => {
     expect(Value.Check(DesiredState, doc)).toBe(false);
   });
 
-  it('rejects a missing programNumber', () => {
+  it('accepts a missing programNumber (daemon PAT-probes)', () => {
     const doc = atXDoc() as unknown as { sessions: [{ tsreadex: Record<string, unknown> }] };
     delete doc.sessions[0].tsreadex['programNumber'];
-    expect(Value.Check(DesiredState, doc)).toBe(false);
+    expect(Value.Check(DesiredState, doc)).toBe(true);
+  });
+
+  it('accepts a url-source session with an empty tsreadex object', () => {
+    const doc = atXDoc();
+    doc.sessions[0]!.source = { url: 'http://example.local/stream.ts' };
+    doc.sessions[0]!.tsreadex = {};
+    expect(Value.Check(DesiredState, doc)).toBe(true);
   });
 
   it('rejects a wrong apiVersion', () => {
@@ -134,6 +146,84 @@ describe('DesiredState', () => {
       captionMode: 5,
       superimposeMode: 2,
     });
+  });
+});
+
+describe('SourcesResponse', () => {
+  const entry = {
+    id: 'louise-1',
+    name: 'Louise 1',
+    url: 'https://louise.example/stream?id=1',
+    logo: 'https://louise.example/logo.png',
+    chno: '9.1',
+  };
+
+  it('accepts a full catalog entry and a minimal one', () => {
+    expect(Value.Check(SourceCatalogEntry, entry)).toBe(true);
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', url: 'http://x/' })).toBe(true);
+  });
+
+  it('rejects an entry missing url', () => {
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X' })).toBe(false);
+  });
+
+  it('accepts a populated response and a no-catalog response', () => {
+    const populated = {
+      apiVersion: 1,
+      catalogHash: 'abc123',
+      updatedAt: '2026-07-06T00:00:00.000Z',
+      entries: [entry],
+      warnings: ['duplicate id louise-1 renamed to louise-1-2'],
+    };
+    expect(Value.Check(SourcesResponse, populated)).toBe(true);
+    expect(
+      Value.Check(SourcesResponse, { apiVersion: 1, catalogHash: null, updatedAt: null, entries: [] }),
+    ).toBe(true);
+  });
+
+  it('rejects a response with an entry missing url', () => {
+    const doc = {
+      apiVersion: 1,
+      catalogHash: 'abc123',
+      updatedAt: null,
+      entries: [{ id: 'x', name: 'X' }],
+    };
+    expect(Value.Check(SourcesResponse, doc)).toBe(false);
+  });
+});
+
+describe('StatusResponse / SessionStatus additions', () => {
+  function statusDoc(): StatusResponseT {
+    return {
+      apiVersion: 1,
+      daemonVersion: '1.2.3',
+      startedAt: '2026-07-06T00:00:00.000Z',
+      uptimeSec: 60,
+      capabilities: ['qsv'],
+      templates: [{ id: 'arib-hls', version: 1 }],
+      desiredRevision: 'r1',
+      sessions: [],
+    };
+  }
+
+  it('accepts sourcesHash present, null, and absent', () => {
+    expect(Value.Check(StatusResponse, { ...statusDoc(), sourcesHash: 'abc123' })).toBe(true);
+    expect(Value.Check(StatusResponse, { ...statusDoc(), sourcesHash: null })).toBe(true);
+    expect(Value.Check(StatusResponse, statusDoc())).toBe(true);
+  });
+
+  it('accepts a session status with detectedProgramNumber', () => {
+    const session = {
+      name: 'at-x',
+      state: 'running',
+      enabled: true,
+      configHash: 'deadbeef',
+      restarts: 0,
+      consecutiveFailures: 0,
+      detectedProgramNumber: 333,
+    };
+    expect(Value.Check(SessionStatus, session)).toBe(true);
+    expect(Value.Check(StatusResponse, { ...statusDoc(), sessions: [session] })).toBe(true);
   });
 });
 

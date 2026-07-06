@@ -30,6 +30,7 @@ import { createServer } from './api/server.js';
 import { loadConfig } from './config.js';
 import type { DesiredSession } from './contract/v1.js';
 import { buildPipeline } from './pipeline/build.js';
+import { SourcesCatalog } from './sources/catalog.js';
 import { DesiredStore } from './state/desiredStore.js';
 import { Supervisor } from './supervise/supervisor.js';
 import { VERSION } from './version.js';
@@ -65,7 +66,12 @@ async function main(): Promise<void> {
 
   await supervisor.startFromDisk();
 
-  const server = createServer({ supervisor, config, logger });
+  // external-sources catalog: first read before the API is reachable, then
+  // the 5s mtime poll (no-op when sourcesM3u is null)
+  const catalog = new SourcesCatalog(config.sourcesM3u, { logger });
+  await catalog.start();
+
+  const server = createServer({ supervisor, config, catalog, logger });
   await server.listen({ host: config.listen.host, port: config.listen.port });
   logger.info(
     `restreamer ${VERSION} listening on ${config.listen.host}:${config.listen.port} ` +
@@ -78,6 +84,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info(`received ${signal} — stopping API, then draining sessions`);
     void (async () => {
+      catalog.stop();
       await server.close().catch((err: unknown) => {
         logger.warn(`server close failed: ${err instanceof Error ? err.message : String(err)}`);
       });

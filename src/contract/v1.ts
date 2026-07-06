@@ -75,8 +75,12 @@ export type SessionSource = Static<typeof SessionSource>;
  * `tsreadex -a 13 -b 7 -c 5 -u 2 -n <sid>`.
  */
 export const TsreadexParams = Type.Object({
-  /** service SID (program number) → `tsreadex -n`; normally derived channel→service→sid by the controller */
-  programNumber: Type.Integer({ minimum: 0 }),
+  /**
+   * service SID (program number) → `tsreadex -n`; normally derived
+   * channel→service→sid by the controller. Absent = the daemon PAT-probes the
+   * source and picks the single (or lowest, logged) program_number.
+   */
+  programNumber: Type.Optional(Type.Integer({ minimum: 0 })),
   /** ARIB primary-audio mode → `tsreadex -a` */
   audio1Mode: Type.Optional(Type.Integer({ default: 13 })),
   /** ARIB secondary-audio mode → `tsreadex -b` */
@@ -256,6 +260,11 @@ export const SessionStatus = Type.Object({
   lastSegmentAt: Type.Optional(Type.String()),
   /** wall-clock lag of the media playlist — the truthful per-session health signal */
   playlistLagSec: Type.Optional(Type.Number()),
+  /**
+   * PAT-probed program number for the current source. Absent when an explicit
+   * `programNumber` was supplied or the probe hasn't succeeded yet.
+   */
+  detectedProgramNumber: Type.Optional(Type.Integer()),
 });
 export type SessionStatus = Static<typeof SessionStatus>;
 
@@ -272,9 +281,51 @@ export const StatusResponse = Type.Object({
   templates: Type.Array(Type.Object({ id: Type.String(), version: Type.Integer() })),
   /** revision of the persisted desired doc; null when never pushed (controller pushes immediately on mismatch) */
   desiredRevision: Type.Union([Type.String(), Type.Null()]),
+  /**
+   * Fingerprint of the local sources.m3u catalog — the poller re-fetches
+   * `GET /v1/sources` when it changes. Absent = old daemon (no sources API);
+   * null = no `sourcesM3u` configured.
+   */
+  sourcesHash: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   sessions: Type.Array(SessionStatus),
 });
 export type StatusResponse = Static<typeof StatusResponse>;
+
+// ---------------------------------------------------------------------------
+// Sources catalog (GET /v1/sources)
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry of the daemon's local `sources.m3u` catalog (non-tvheadend
+ * sources the controller can target via a `UrlSource` session).
+ */
+export const SourceCatalogEntry = Type.Object({
+  /**
+   * Stable entry id — `tvg-id` when present, else a slug derived from the
+   * name. Set `tvg-id` for stability: the controller stores this id.
+   */
+  id: Type.String({ minLength: 1 }),
+  name: Type.String({ minLength: 1 }),
+  url: Type.String({ minLength: 1 }),
+  /** `tvg-logo` — emitted verbatim */
+  logo: Type.Optional(Type.String()),
+  /** `tvg-chno` — STRING channel number, same identity conventions as tvheadend channel numbers ("9.1" ≠ "9.10") */
+  chno: Type.Optional(Type.String()),
+});
+export type SourceCatalogEntry = Static<typeof SourceCatalogEntry>;
+
+/** GET /v1/sources response. */
+export const SourcesResponse = Type.Object({
+  apiVersion: Type.Literal(1),
+  /** stable hash of `entries`; null when no `sourcesM3u` is configured */
+  catalogHash: Type.Union([Type.String(), Type.Null()]),
+  /** ISO 8601 mtime of the last successful parse; null when never parsed */
+  updatedAt: Type.Union([Type.String(), Type.Null()]),
+  entries: Type.Array(SourceCatalogEntry),
+  /** non-fatal parse warnings (skipped lines, duplicate ids, …) */
+  warnings: Type.Optional(Type.Array(Type.String())),
+});
+export type SourcesResponse = Static<typeof SourcesResponse>;
 
 // ---------------------------------------------------------------------------
 // Log tail (GET /v1/sessions/:name/log?lines=N)

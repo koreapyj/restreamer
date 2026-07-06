@@ -25,11 +25,13 @@ import type { TsreadexParams } from '../contract/v1.js';
  * `tsreadex -n <sid> -a 13 -b 7 -c 5 -u 2 -` — trailing `-` reads stdin.
  * The `??` fallbacks mirror the contract-schema defaults so this stays
  * correct even when the caller has not run `Value.Default` first.
+ *
+ * `-n` is emitted only when `programNumber` is present; when absent the
+ * supervisor PAT-probes the source and prepends `-n <detected>` itself.
  */
 export function buildTsreadexArgv(params: TsreadexParams): string[] {
   return [
-    '-n',
-    String(params.programNumber),
+    ...(typeof params.programNumber === 'number' ? ['-n', String(params.programNumber)] : []),
     '-a',
     String(params.audio1Mode ?? 13),
     '-b',

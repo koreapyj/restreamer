@@ -48,6 +48,8 @@ export class FakeChild extends EventEmitter implements ChildHandle {
   exitOnSigterm = true;
   exitOnSigkill = true;
   exited = false;
+  /** everything written to stdin, in arrival order */
+  stdinChunks: Buffer[] = [];
 
   constructor(pid: number) {
     super();
@@ -55,7 +57,12 @@ export class FakeChild extends EventEmitter implements ChildHandle {
     this.stdio = [this.stdin, this.stdout, this.stderr, this.fd3];
     // sinks so pipes never block or throw
     this.stdin.on('error', () => undefined);
-    this.stdin.resume();
+    this.stdin.on('data', (chunk: Buffer) => this.stdinChunks.push(chunk));
+  }
+
+  /** all stdin bytes received so far, concatenated */
+  stdinBytes(): Buffer {
+    return Buffer.concat(this.stdinChunks);
   }
 
   kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {
@@ -268,6 +275,7 @@ export function sampleBuilt(name: string): BuiltPipeline {
     tsreadexArgv: ['-n', '1064', '-a', '13', '-b', '7', '-c', '5', '-u', '2', '-'],
     ffmpegArgv: ['-nostats', '-i', '-', '-progress', 'pipe:3'],
     outDir: `/media/${name}`,
+    needsProgramNumber: false,
   };
 }
 

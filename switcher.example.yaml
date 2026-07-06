@@ -24,3 +24,15 @@ probeIntervalMs: 15000
 # An upstream is stale (unhealthy) when its media playlist's PROGRAM-DATE-TIME
 # lags wall clock by more than 3 x segmentSeconds + stallGraceSec.
 stallGraceSec: 10
+
+# How media playlists reference segments (master playlists are always fully
+# relative, so a reverse proxy can mount the switcher under any path):
+#   redirect  (default) relative `seg/<upstreamId>/<file>` URIs answered by
+#             the switcher with a cacheable 302 to the upstream node; segment
+#             bytes still flow node -> viewer directly. The upstream id baked
+#             into each URI lets a viewer holding a pre-failover cached
+#             playlist keep fetching old-upstream segments after a switch.
+#   upstream  absolute upstream node URLs embedded in the playlists (no
+#             per-segment redirect round-trip; viewers must be able to reach
+#             the upstream nodes under exactly those URLs).
+segmentUrls: redirect

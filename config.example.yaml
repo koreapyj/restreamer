@@ -20,6 +20,13 @@ stateFile: /var/lib/restreamer/desired.json
 # Local tvheadend instance; sessions stream /stream/channel/<uuid> from here.
 tvhBaseUrl: http://127.0.0.1:9981
 
+# Local M3U catalog of external (non-tvheadend) sources, exposed to the
+# controller via GET /v1/sources and re-read when its mtime changes.
+# Give each #EXTINF a tvg-id so entry ids stay stable across renames
+# (the controller stores the id as source_key). null = no catalog.
+# sourcesM3u: /etc/restreamer/sources.m3u
+sourcesM3u: null
+
 # Subscription weight used when a session's source doesn't specify one
 # (tvheadend preempts by weight; DVR wins).
 defaultWeight: 100

@@ -22,12 +22,22 @@
  * A channel has N hot-hot upstream encodes (same profile ⇒ identical
  * variant/rendition layout). Viewers play one stable switcher URL; this
  * module mirrors the ACTIVE upstream's playlists with:
- *   - master:  variant/rendition URIs rewritten to the switcher's own routes
- *              (`/hls/<slug>/<variant>/stream.m3u8`),
- *   - media:   segment / EXT-X-MAP URIs rewritten to ABSOLUTE upstream URLs
- *              (segments flow node→viewer directly; the switcher serves only
- *              small text), MEDIA-SEQUENCE / DISCONTINUITY-SEQUENCE replaced
- *              by virtual values, and an EXT-X-DISCONTINUITY spliced in at
+ *   - master:  variant/rendition URIs kept RELATIVE to the master's own URL
+ *              (`<variant>/stream.m3u8`) so they resolve to the switcher's
+ *              media routes wherever a reverse proxy mounts it,
+ *   - media:   segment / EXT-X-MAP URIs rewritten per `segmentUrls`:
+ *                'redirect' (default) — RELATIVE `seg/<upstreamId>/<file>`,
+ *                resolving to the switcher's redirect route which 302s to the
+ *                upstream. The upstream id is baked into each URI at render
+ *                time so a viewer holding a pre-failover cached playlist can
+ *                still fetch old-upstream segments after a switch (they would
+ *                404 on the new upstream).
+ *                'upstream' — ABSOLUTE upstream URLs (no per-segment redirect
+ *                round-trip; playlists are tied to the upstream host).
+ *              Either way segment bytes flow node→viewer directly (the
+ *              switcher serves only small text and redirects), and
+ *              MEDIA-SEQUENCE / DISCONTINUITY-SEQUENCE are replaced by
+ *              virtual values with an EXT-X-DISCONTINUITY spliced in at
  *              switch points.
  *
  * ── Virtual MEDIA-SEQUENCE (monotonic across switches AND restarts) ────────
@@ -240,6 +250,17 @@ function rewriteUriAttr(line: string, rewrite: (uri: string) => string): string 
   return line.replace(/URI="([^"]*)"/, (_m, uri: string) => `URI="${rewrite(uri)}"`);
 }
 
+/** how media-playlist segment / EXT-X-MAP URIs are emitted (see module header) */
+export type SegmentUrlMode = 'redirect' | 'upstream';
+
+/**
+ * Filenames the segment redirect route accepts: flat names only — no slashes
+ * (no path traversal, no subdirectories) and no `.`/`..` path steps. Shared
+ * with server.ts's route guard so the playlist rewriter never emits a
+ * `seg/…` URI the route would reject.
+ */
+export const SAFE_SEGMENT_FILE = /^(?!\.\.?$)[\w.\-]+$/;
+
 interface RenderMediaOpts {
   virtualSeq: number;
   virtualDiscSeq: number;
@@ -249,20 +270,32 @@ interface RenderMediaOpts {
   discIndex: number;
   /** absolute upstream base for this variant: `<upstream url>/<variant>` */
   base: string;
+  mode: SegmentUrlMode;
+  /** id of the upstream this playlist was fetched from, baked into `seg/…` URIs */
+  upstreamId: string;
 }
 
 function renderMediaPlaylist(p: ParsedMedia, o: RenderMediaOpts): string {
   const abs = (uri: string) => (isAbsoluteUri(uri) ? uri : `${o.base}/${uri}`);
+  // redirect mode: flat relative filenames become `seg/<upstreamId>/<file>`,
+  // relative to the media playlist's own URL. Anything the redirect route
+  // could not serve (absolute URIs, paths with directories) falls back to
+  // the absolute upstream form.
+  const rewrite =
+    o.mode === 'redirect'
+      ? (uri: string) =>
+          !isAbsoluteUri(uri) && SAFE_SEGMENT_FILE.test(uri) ? `seg/${o.upstreamId}/${uri}` : abs(uri)
+      : abs;
   const out: string[] = ['#EXTM3U'];
   for (const h of p.headerLines) {
-    out.push(h.startsWith('#EXT-X-MAP') ? rewriteUriAttr(h, abs) : h);
+    out.push(h.startsWith('#EXT-X-MAP') ? rewriteUriAttr(h, rewrite) : h);
   }
   out.push(`#EXT-X-MEDIA-SEQUENCE:${o.virtualSeq}`);
   out.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${o.virtualDiscSeq}`);
   p.segments.slice(o.drop).forEach((seg, i) => {
     if (i === o.discIndex) out.push('#EXT-X-DISCONTINUITY');
     out.push(...seg.tags);
-    out.push(abs(seg.uri));
+    out.push(rewrite(seg.uri));
   });
   if (p.endList) out.push('#EXT-X-ENDLIST');
   return `${out.join('\n')}\n`;
@@ -270,13 +303,14 @@ function renderMediaPlaylist(p: ParsedMedia, o: RenderMediaOpts): string {
 
 /**
  * Rewrites a master playlist: relative `<variant>/stream.m3u8` URIs (variant
- * playlists AND audio/subtitle rendition URI attributes) become the
- * switcher's own routes; other relative URIs are absolutized against the
- * upstream; absolute URIs and every non-URI line pass through verbatim.
+ * playlists AND audio/subtitle rendition URI attributes) stay RELATIVE to
+ * the master's own URL — they resolve to the switcher's media routes
+ * wherever a reverse proxy mounts it; other relative URIs are absolutized
+ * against the upstream; absolute URIs and every non-URI line pass through
+ * verbatim.
  */
 export function rewriteMasterPlaylist(
   text: string,
-  slug: string,
   upstreamUrl: string,
 ): { text: string; variants: string[] } {
   const variants: string[] = [];
@@ -285,7 +319,7 @@ export function rewriteMasterPlaylist(
     const m = /^(.+)\/stream\.m3u8$/.exec(uri);
     if (m?.[1]) {
       variants.push(m[1]);
-      return `/hls/${slug}/${m[1]}/stream.m3u8`;
+      return `${m[1]}/stream.m3u8`;
     }
     return `${upstreamUrl}/${uri}`;
   };
@@ -348,6 +382,8 @@ interface CacheEntry {
 export interface StitcherOptions {
   cacheTtlMs: number;
   stallGraceSec: number;
+  /** media-playlist segment URI shape (default 'redirect', see module header) */
+  segmentUrls?: SegmentUrlMode;
   fetchImpl?: typeof fetch;
   /** injectable clock (ms since epoch) */
   now?: () => number;
@@ -361,6 +397,7 @@ const NULL_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 export class Stitcher {
   private readonly cacheTtlMs: number;
   private readonly stallGraceSec: number;
+  private readonly segmentUrls: SegmentUrlMode;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly logger: Logger;
@@ -374,6 +411,7 @@ export class Stitcher {
   constructor(opts: StitcherOptions) {
     this.cacheTtlMs = opts.cacheTtlMs;
     this.stallGraceSec = opts.stallGraceSec;
+    this.segmentUrls = opts.segmentUrls ?? 'redirect';
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.logger = opts.logger ?? NULL_LOGGER;
@@ -515,7 +553,7 @@ export class Stitcher {
       if (res.ok) {
         // master has no PDT — fetch success alone marks reachable; preserve any known lag
         this.markHealth(ch, upstream.id, true, ch.health.get(upstream.id)?.playlistLagSec ?? null);
-        const { text, variants } = rewriteMasterPlaylist(res.text, slug, upstream.url);
+        const { text, variants } = rewriteMasterPlaylist(res.text, upstream.url);
         for (const v of variants) ch.knownVariants.add(v);
         return text;
       }
@@ -651,7 +689,24 @@ export class Stitcher {
       drop,
       discIndex,
       base: `${trimSlash(upstream.url)}/${variant}`,
+      mode: this.segmentUrls,
+      upstreamId: upstream.id,
     });
+  }
+
+  /**
+   * Base URL of a channel's upstream, for the segment redirect route
+   * (`GET /hls/:slug/:variant/seg/:upstreamId/:file` → 302 to
+   * `<url>/<variant>/<file>`). An upstream that disappeared from the desired
+   * doc while its segments are still referenced by a viewer's cached playlist
+   * window throws UnknownUpstreamError (→ 404 upstairs) — acceptable: the
+   * live window is ~10 min and desired-state changes are rare.
+   */
+  upstreamUrl(slug: string, upstreamId: string): string {
+    const ch = this.requireChannel(slug);
+    const up = ch.channel.upstreams.find((u) => u.id === upstreamId);
+    if (!up) throw new UnknownUpstreamError(`unknown upstream ${upstreamId} for channel ${slug}`);
+    return trimSlash(up.url);
   }
 
   // -------------------------------------------------------------------------
@@ -681,7 +736,7 @@ export class Stitcher {
       this.markHealth(ch, up.id, false, null, master.error ?? `HTTP ${master.status}`);
       return;
     }
-    const { variants } = rewriteMasterPlaylist(master.text, ch.channel.slug, up.url);
+    const { variants } = rewriteMasterPlaylist(master.text, up.url);
     for (const v of variants) ch.knownVariants.add(v);
     const variant = variants[0] ?? [...ch.knownVariants][0];
     if (variant === undefined) {

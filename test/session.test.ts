@@ -7,15 +7,17 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DesiredSession } from '../src/contract/v1.js';
-import { Session } from '../src/supervise/session.js';
-import type { SessionSettings } from '../src/supervise/types.js';
+import { PAT_PROBE_MAX_BYTES, Session } from '../src/supervise/session.js';
+import type { BuiltPipeline, SessionSettings } from '../src/supervise/types.js';
 import { fakeSource, fakeSpawn, flush, memFs, sampleBuilt, sampleDesired, sampleSettings, silentLogger } from './support/fakes.js';
+import { nullPacket, patStream } from './support/tsFixtures.js';
 
 function makeSession(
   opts: {
     status?: number;
     settings?: Partial<SessionSettings>;
     desired?: Partial<DesiredSession>;
+    pipeline?: Partial<BuiltPipeline>;
     readRssMb?: (pid: number) => Promise<number | null>;
   } = {},
 ) {
@@ -24,7 +26,7 @@ function makeSession(
   const fs = memFs();
   const session = new Session({
     desired: sampleDesired(opts.desired),
-    pipeline: sampleBuilt('at-x'),
+    pipeline: { ...sampleBuilt('at-x'), ...opts.pipeline },
     configHash: 'hash-1',
     settings: sampleSettings(opts.settings),
     deps: {
@@ -393,6 +395,111 @@ describe('graceful stop', () => {
     expect(spawn.tsreadex().killed).toEqual([]);
     expect(spawn.ffmpeg().killed).toEqual([]);
     expect(session.status().nextRetryAt).toBeUndefined(); // intentional stop → no reschedule
+  });
+});
+
+describe('PAT probe (needsProgramNumber)', () => {
+  // argv the builder produces when programNumber is absent — no -n
+  const PROBED_ARGV = ['-a', '13', '-b', '7', '-c', '5', '-u', '2', '-'];
+  const NO_PAT_ERROR =
+    'no PAT found in the first 2MiB/10s of the source — cannot derive a program number; set a manual programNumber override';
+
+  function makeProbeSession() {
+    return makeSession({ pipeline: { tsreadexArgv: PROBED_ARGV, needsProgramNumber: true } });
+  }
+
+  it('spawns tsreadex with the detected -n prepended and forwards the probed bytes before the live ones', async () => {
+    const { session, spawn, source } = makeProbeSession();
+    const starting = session.start();
+    await flush();
+    expect(spawn.calls).toHaveLength(0); // probing — nothing spawned yet
+    expect(session.status().state).toBe('starting');
+    expect(session.status().detectedProgramNumber).toBeUndefined();
+
+    const probeBytes = patStream([{ programNumber: 1064, pmtPid: 0x1f0 }]);
+    source.body().write(probeBytes);
+    await starting;
+
+    expect(session.state).toBe('running');
+    expect(spawn.calls[0]?.command).toBe('tsreadex');
+    expect(spawn.calls[0]?.argv).toEqual(['-n', '1064', ...PROBED_ARGV]);
+    expect(session.status().detectedProgramNumber).toBe(1064);
+
+    // bytes consumed by the probe reach tsreadex first, then the live stream
+    source.body().write(Buffer.from('LIVE-BYTES'));
+    await flush();
+    const stdin = spawn.tsreadex().stdinBytes();
+    expect(stdin.equals(Buffer.concat([probeBytes, Buffer.from('LIVE-BYTES')]))).toBe(true);
+
+    // detected value is kept across restarts until a new probe result
+    spawn.ffmpeg().exit(1);
+    expect(session.state).toBe('backoff');
+    expect(session.status().detectedProgramNumber).toBe(1064);
+  });
+
+  it('probe timeout: generation dies as crash with the no-PAT lastError and retries via backoff', async () => {
+    const { session, spawn, source } = makeProbeSession();
+    const starting = session.start();
+    await flush();
+    source.body().write(nullPacket()); // bytes flow, but no PAT
+    await vi.advanceTimersByTimeAsync(10_000);
+    await starting;
+
+    expect(session.state).toBe('backoff');
+    expect(spawn.calls).toHaveLength(0); // children never spawned
+    const st = session.status();
+    expect(st.lastExit?.class).toBe('crash');
+    expect(st.lastError).toBe(NO_PAT_ERROR);
+    expect(st.consecutiveFailures).toBe(1);
+    expect(retryInMs(session)).toBe(2_000); // normal crash backoff schedule
+    expect(source.aborts).toBe(1); // generation torn down
+
+    await vi.advanceTimersByTimeAsync(2_001);
+    await flush();
+    expect(source.calls).toHaveLength(2); // fresh generation, probing again
+    expect(session.status().state).toBe('starting');
+  });
+
+  it('probe byte bound: 2MiB without a PAT fails the generation as crash', async () => {
+    const { session, spawn, source } = makeProbeSession();
+    const starting = session.start();
+    await flush();
+    source.body().write(Buffer.alloc(PAT_PROBE_MAX_BYTES, 0x00));
+    await starting;
+
+    expect(session.state).toBe('backoff');
+    expect(spawn.calls).toHaveLength(0);
+    expect(session.status().lastExit?.class).toBe('crash');
+    expect(session.status().lastError).toBe(NO_PAT_ERROR);
+  });
+
+  it('explicit programNumber: start() completes without any source bytes — no probe attached', async () => {
+    const { session, spawn } = makeSession(); // default pipeline: needsProgramNumber false
+    await session.start(); // would hang on the probe if one were attached
+    expect(session.state).toBe('running');
+    expect(spawn.calls[0]?.argv).toEqual(sampleBuilt('at-x').tsreadexArgv);
+    expect(session.status().detectedProgramNumber).toBeUndefined();
+  });
+
+  it('stop() during the probe aborts cleanly — no children, no error, no restart', async () => {
+    const { session, spawn, source } = makeProbeSession();
+    const starting = session.start();
+    await flush();
+
+    const stopping = session.stop();
+    await starting;
+    await stopping;
+
+    expect(session.state).toBe('stopped');
+    expect(spawn.calls).toHaveLength(0);
+    expect(source.aborts).toBe(1);
+    expect(session.status().nextRetryAt).toBeUndefined();
+    expect(session.status().lastError).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(60_000); // probe timeout + any retry window
+    await flush();
+    expect(source.calls).toHaveLength(1); // never resurrected
+    expect(session.state).toBe('stopped');
   });
 });
 

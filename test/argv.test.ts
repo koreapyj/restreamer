@@ -178,6 +178,18 @@ describe('golden: production at-x argv parity', () => {
     expect(built.tsreadexArgv).toEqual(['-n', '333', '-a', '13', '-b', '7', '-c', '5', '-u', '2', '-']);
   });
 
+  it('omits -n when programNumber is absent (supervisor PAT-probes and prepends it)', () => {
+    const session = atXSession();
+    session.tsreadex = {};
+    const withoutSid = buildPipeline(session, ctx);
+    expect(withoutSid.tsreadexArgv).toEqual(['-a', '13', '-b', '7', '-c', '5', '-u', '2', '-']);
+    expect(withoutSid.needsProgramNumber).toBe(true);
+  });
+
+  it('sets needsProgramNumber false when programNumber is explicit', () => {
+    expect(built.needsProgramNumber).toBe(false);
+  });
+
   it('reproduces the production ffmpeg argv token-for-token', () => {
     expect(built.ffmpegArgv).toEqual(PROD_FFMPEG_ARGV);
   });

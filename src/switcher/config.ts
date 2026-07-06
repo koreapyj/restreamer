@@ -42,6 +42,15 @@ export const SwitcherConfigSchema = Type.Object({
   probeIntervalMs: Type.Number({ minimum: 100, default: 15_000 }),
   /** failover threshold = 3 × segmentSeconds + stallGraceSec of upstream playlist PDT lag */
   stallGraceSec: Type.Number({ minimum: 0, default: 10 }),
+  /**
+   * Media-playlist segment URI shape:
+   *   'redirect' (default) — relative `seg/<upstreamId>/<file>` URIs served
+   *     by the switcher's 302 redirect route; playlists are fully relative,
+   *     so a reverse proxy can mount the switcher under any path.
+   *   'upstream' — absolute upstream node URLs, for setups where the extra
+   *     per-segment redirect round-trip is undesirable.
+   */
+  segmentUrls: Type.Union([Type.Literal('redirect'), Type.Literal('upstream')], { default: 'redirect' }),
 });
 export type SwitcherConfig = Static<typeof SwitcherConfigSchema>;
 

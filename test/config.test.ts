@@ -34,6 +34,7 @@ describe('loadConfig', () => {
       serveDir: '/media',
       stateFile: '/var/lib/restreamer/desired.json',
       tvhBaseUrl: 'http://127.0.0.1:9981',
+      sourcesM3u: null,
       defaultWeight: 100,
       ffmpegPath: 'ffmpeg',
       tsreadexPath: 'tsreadex',
@@ -67,6 +68,17 @@ cleanupOnRemove: false
     expect(cfg.playlistStallSec).toBe(45);
     expect(cfg.cleanupOnRemove).toBe(false);
     expect(cfg.stateFile).toBe('/var/lib/restreamer/desired.json'); // default, untouched
+    expect(cfg.sourcesM3u).toBeNull(); // default, untouched
+  });
+
+  it('accepts an explicit sourcesM3u path', () => {
+    const path = writeConfig('sourcesM3u: /etc/restreamer/sources.m3u\n');
+    expect(loadConfig(path).sourcesM3u).toBe('/etc/restreamer/sources.m3u');
+  });
+
+  it('accepts an explicit sourcesM3u null', () => {
+    const path = writeConfig('sourcesM3u: null\n');
+    expect(loadConfig(path).sourcesM3u).toBeNull();
   });
 
   it('resolves the config path from $RESTREAMER_CONFIG', () => {

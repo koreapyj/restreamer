@@ -29,7 +29,7 @@
  * fake binary with the genuine production argv.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import os from 'node:os';
@@ -40,8 +40,9 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, expect, test } from 'vitest';
 import { createServer } from '../src/api/server.js';
 import type { DaemonConfig } from '../src/config.js';
-import { type DesiredSession, type DesiredState, StatusResponse } from '../src/contract/v1.js';
+import { type DesiredSession, type DesiredState, SourcesResponse, StatusResponse } from '../src/contract/v1.js';
 import { buildPipeline } from '../src/pipeline/build.js';
+import { SourcesCatalog } from '../src/sources/catalog.js';
 import { DesiredStore } from '../src/state/desiredStore.js';
 import { Supervisor } from '../src/supervise/supervisor.js';
 import { VERSION } from '../src/version.js';
@@ -55,6 +56,7 @@ let tmpDir: string;
 let serveDir: string;
 let source: http.Server;
 let supervisor: Supervisor;
+let catalog: SourcesCatalog;
 let server: FastifyInstance;
 let base: string;
 
@@ -74,11 +76,27 @@ beforeAll(async () => {
   await new Promise<void>((resolve) => source.listen(0, '127.0.0.1', resolve));
   const sourcePort = (source.address() as AddressInfo).port;
 
+  // external-sources catalog: a real temp file read by the real SourcesCatalog
+  const sourcesM3u = path.join(tmpDir, 'sources.m3u');
+  writeFileSync(
+    sourcesM3u,
+    [
+      '#EXTM3U',
+      '#EXTINF:-1 tvg-id="ext-1" tvg-logo="http://logo/1.png" tvg-chno="9.1",External One',
+      'https://ext.example/one/index.m3u8',
+      '#EXTINF:-1,External Two',
+      'https://ext.example/two/index.m3u8',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+
   const config: DaemonConfig = {
     listen: { host: '127.0.0.1', port: 0 },
     serveDir,
     stateFile: `${tmpDir.replace(/\\/g, '/')}/state/desired.json`,
     tvhBaseUrl: `http://127.0.0.1:${sourcePort}`,
+    sourcesM3u,
     defaultWeight: 100,
     ffmpegPath: process.execPath,
     tsreadexPath: process.execPath,
@@ -114,12 +132,16 @@ beforeAll(async () => {
   });
   await supervisor.startFromDisk();
 
-  server = createServer({ supervisor, config, logger: silentLogger });
+  catalog = new SourcesCatalog(config.sourcesM3u, { logger: silentLogger });
+  await catalog.start();
+
+  server = createServer({ supervisor, config, catalog, logger: silentLogger });
   await server.listen({ host: '127.0.0.1', port: 0 });
   base = `http://127.0.0.1:${(server.server.address() as AddressInfo).port}`;
 }, 20_000);
 
 afterAll(async () => {
+  catalog?.stop();
   await server?.close();
   await supervisor?.stopAll();
   await new Promise<void>((resolve) => source?.close(() => resolve()));
@@ -252,3 +274,28 @@ test.sequential(
   },
   30_000,
 );
+
+test.sequential('daemon e2e: GET /v1/sources serves the local catalog; status carries its hash', async () => {
+  const { status, body } = await getJson('/v1/sources');
+  expect(status).toBe(200);
+  expect(Value.Check(SourcesResponse, body), 'GET /v1/sources must match the wire contract').toBe(true);
+  const sources = body as SourcesResponse;
+
+  expect(sources.catalogHash).toBeTypeOf('string'); // non-null: a catalog is configured
+  expect(sources.updatedAt).toBeTypeOf('string');
+  expect(sources.warnings).toBeUndefined();
+  expect(sources.entries).toEqual([
+    {
+      id: 'ext-1',
+      name: 'External One',
+      url: 'https://ext.example/one/index.m3u8',
+      logo: 'http://logo/1.png',
+      chno: '9.1',
+    },
+    // no tvg-id → slug of the display name
+    { id: 'external-two', name: 'External Two', url: 'https://ext.example/two/index.m3u8' },
+  ]);
+
+  const statusBody = await pollStatus(() => true, 'status with sourcesHash');
+  expect(statusBody.sourcesHash).toBe(sources.catalogHash);
+});

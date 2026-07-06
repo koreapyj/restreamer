@@ -44,6 +44,11 @@ export interface BuiltPipeline {
   ffmpegArgv: string[];
   /** forward-slash path — target runtime is Linux */
   outDir: string;
+  /**
+   * true when the session has no explicit `tsreadex.programNumber` — argv
+   * lacks `-n`; the supervisor PAT-probes the source and prepends it.
+   */
+  needsProgramNumber: boolean;
 }
 
 export class PipelineBuildError extends Error {
@@ -80,5 +85,6 @@ export function buildPipeline(session: DesiredSession, ctx: BuildCtx): BuiltPipe
     tsreadexArgv: buildTsreadexArgv(filled.tsreadex),
     ffmpegArgv: template.build(filled.pipeline, { outDir, progress: ctx.progress }),
     outDir,
+    needsProgramNumber: typeof filled.tsreadex.programNumber !== 'number',
   };
 }

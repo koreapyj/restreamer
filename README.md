@@ -26,6 +26,7 @@ production values); see `config.example.yaml` for the commented version.
 | `serveDir` | `/media` | HLS output root; each session writes `<serveDir>/<name>/` |
 | `stateFile` | `/var/lib/restreamer/desired.json` | atomic persistence of the accepted desired doc |
 | `tvhBaseUrl` | `http://127.0.0.1:9981` | local tvheadend; sessions stream `/stream/channel/<uuid>` |
+| `sourcesM3u` | `null` | local M3U catalog of external (non-tvheadend) sources, served as `GET /v1/sources`; `null` = no catalog |
 | `defaultWeight` | `100` | tvh subscription weight when a session doesn't set one |
 | `ffmpegPath` / `tsreadexPath` | `ffmpeg` / `tsreadex` | child binaries |
 | `capabilities` | `[qsv, opencl]` | advertised in `/v1/status`, matched against template `requiredCaps` |
@@ -36,6 +37,26 @@ production values); see `config.example.yaml` for the commented version.
 | `stopGraceSec` | `10` | graceful stop: abort source → wait → SIGTERM → SIGKILL +5s |
 | `cleanupOnRemove` | `true` | delete `<serveDir>/<name>/` when a session leaves the desired doc |
 
+### External sources catalog
+
+`sourcesM3u` points at a local M3U file describing non-tvheadend sources the
+controller can stream through this daemon (as `{url}` sessions). The daemon
+re-reads it when its mtime changes (5 s poll, rename-replace safe) and serves
+the parsed entries as `GET /v1/sources`; a read failure keeps the last good
+catalog. Format:
+
+```m3u
+#EXTM3U
+#EXTINF:-1 tvg-id="ext-news" tvg-logo="https://cdn.example/news.png" tvg-chno="9.1",News Channel
+https://cdn.example/news/index.m3u8
+```
+
+Always set `tvg-id`: it is the entry's stable id (the controller stores it as
+`source_key`). Without it the id is derived from the display name, so renaming
+the entry breaks any channel pointing at it. `tvg-logo`/`tvg-chno` are
+optional and passed through verbatim; the display name is the text after the
+last comma of the `#EXTINF` line.
+
 ## HTTP API (wire contract v1)
 
 Canonical schemas: `src/contract/v1.ts` (vendored by tvh-controller). Every
@@ -44,7 +65,8 @@ LAN-isolated by contract. Errors are uniform `{error, details?}` JSON.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /v1/status` | daemon version/uptime, capabilities, templates, `desiredRevision`, per-session `SessionStatus` |
+| `GET /v1/status` | daemon version/uptime, capabilities, templates, `desiredRevision`, `sourcesHash`, per-session `SessionStatus` |
+| `GET /v1/sources` | parsed `sourcesM3u` catalog: `catalogHash`, `updatedAt`, entries, parse warnings |
 | `GET /v1/desired` | persisted desired doc read-back (404 if never set) |
 | `PUT /v1/desired` | **full replacement**; validates every session (schema + dry-run argv build) all-or-nothing; 400 on any failure |
 | `POST /v1/sessions/:name/restart` | kill + respawn, backoff reset |
@@ -125,6 +147,28 @@ To build the deb yourself on Linux:
    `/etc/systemd/system/restreamer.service`, edit `User`/`Group`, and read
    its SECURITY comment before choosing the bind address.
 5. `systemctl daemon-reload && systemctl enable --now restreamer`
+
+## Switcher viewer URLs
+
+Viewers play `GET /hls/<slug>/playlist.m3u8`. Every URI inside the virtual
+playlists is **relative**, so a reverse proxy can mount the switcher under
+any path prefix:
+
+- master playlist → `<variant>/stream.m3u8` (variant streams and
+  audio/subtitle rendition `URI="…"` attributes alike);
+- media playlists → `seg/<upstreamId>/<file>` per segment (and
+  `EXT-X-MAP`), resolved by
+  `GET /hls/<slug>/<variant>/seg/<upstreamId>/<file>` which answers with a
+  302 to the upstream node (`Cache-Control: public, max-age=86400` — a
+  segment's location never changes). Segment bytes still flow node → viewer
+  directly; the switcher serves only playlists and redirects. The upstream
+  id baked into each URI keeps pre-failover cached playlists playable: old
+  segments keep redirecting to the old upstream after a switch.
+
+Set `segmentUrls: upstream` in `switcher.yaml` to embed absolute upstream
+node URLs in media playlists instead (no per-segment redirect round-trip;
+viewers must then reach the upstream nodes under exactly those URLs). Master
+playlists are relative in both modes.
 
 ## Switcher deployment (Kubernetes)
 

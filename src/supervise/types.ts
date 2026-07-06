@@ -37,6 +37,11 @@ export interface BuiltPipeline {
   ffmpegArgv: string[];
   /** session output directory: `<serveDir>/<name>` (POSIX path at runtime) */
   outDir: string;
+  /**
+   * true when the session has no explicit `tsreadex.programNumber` — argv
+   * lacks `-n`; the session PAT-probes the source and prepends it.
+   */
+  needsProgramNumber: boolean;
 }
 
 /** Injected builder — pure; throws on invalid params (used for dry-run validation). */

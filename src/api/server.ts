@@ -30,6 +30,7 @@ import { Value } from '@sinclair/typebox/value';
 import { DesiredState, RESTREAMER_API_VERSION, type StatusResponse } from '../contract/v1.js';
 import type { DaemonConfig } from '../config.js';
 import { templates } from '../pipeline/templates/index.js';
+import type { SourcesCatalog } from '../sources/catalog.js';
 import type { Supervisor } from '../supervise/supervisor.js';
 import type { Logger } from '../supervise/types.js';
 import { VERSION } from '../version.js';
@@ -37,12 +38,14 @@ import { VERSION } from '../version.js';
 export interface ServerDeps {
   supervisor: Supervisor;
   config: DaemonConfig;
+  /** local external-sources catalog (GET /v1/sources, status sourcesHash) */
+  catalog: SourcesCatalog;
   logger?: Logger;
 }
 
 /** Fastify instance implementing the daemon side of the wire contract v1. */
 export function createServer(deps: ServerDeps): FastifyInstance {
-  const { supervisor, config } = deps;
+  const { supervisor, config, catalog } = deps;
   const logger = deps.logger ?? console;
   const startedAtMs = Date.now();
   const startedAtIso = new Date(startedAtMs).toISOString();
@@ -72,8 +75,11 @@ export function createServer(deps: ServerDeps): FastifyInstance {
     capabilities: config.capabilities,
     templates: Object.values(templates).flatMap((t) => (t ? [{ id: t.id, version: t.version }] : [])),
     desiredRevision: supervisor.desiredRevision,
+    sourcesHash: catalog.hash,
     sessions: supervisor.statuses(),
   }));
+
+  app.get('/v1/sources', async () => catalog.snapshot());
 
   app.get('/v1/desired', async (_req, reply) => {
     const doc = supervisor.getDesired();

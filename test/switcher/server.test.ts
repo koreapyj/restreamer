@@ -1,7 +1,9 @@
 /*
  * Route-level tests via fastify.inject: PUT /v1/desired validation +
- * persistence, /v1/status contract shape, manual switch, and the /hls
- * serving routes (content-type, CORS, no-store, 404/503 paths).
+ * persistence, /v1/status contract shape, manual switch, the /hls serving
+ * routes (content-type, CORS, no-store, 404/503 paths) and the segment
+ * redirect route (302, cacheability, traversal guards, both segmentUrls
+ * modes).
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -123,23 +125,26 @@ describe('switcher server', () => {
     expect((await store.load()).selections['ch1']?.upstreamId).toBe('p-b');
   });
 
-  it('GET /hls/:slug/playlist.m3u8 serves the rewritten master with HLS content-type, CORS and no-store', async () => {
+  it('GET /hls/:slug/playlist.m3u8 serves the relative master with HLS content-type, CORS and no-store', async () => {
     await putDesired(desiredDoc());
     const res = await app.inject({ method: 'GET', url: '/hls/ch1/playlist.m3u8' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('application/vnd.apple.mpegurl');
     expect(res.headers['access-control-allow-origin']).toBe('*');
     expect(res.headers['cache-control']).toBe('no-store');
-    expect(res.body).toContain('/hls/ch1/1080p/stream.m3u8');
-    expect(res.body).toContain('URI="/hls/ch1/arib_ass/stream.m3u8"');
+    // relative to the master's own URL: works behind any reverse-proxy prefix
+    expect(res.body).toContain('\n1080p/stream.m3u8');
+    expect(res.body).toContain('URI="arib_ass/stream.m3u8"');
+    expect(res.body).not.toContain('/hls/');
   });
 
-  it('GET /hls media playlist serves rewritten segments; unknown slug/variant are 404', async () => {
+  it('GET /hls media playlist serves relative seg/<upstreamId>/ segments; unknown slug/variant are 404', async () => {
     await putDesired(desiredDoc());
     const res = await app.inject({ method: 'GET', url: '/hls/ch1/1080p/stream.m3u8' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toContain('application/vnd.apple.mpegurl');
-    expect(res.body).toContain(`${NODE_A}/1080p/`);
+    expect(res.body).toContain('\nseg/p-a/');
+    expect(res.body).not.toContain(NODE_A);
 
     const noSlug = await app.inject({ method: 'GET', url: '/hls/nope/playlist.m3u8' });
     expect(noSlug.statusCode).toBe(404);
@@ -148,6 +153,60 @@ describe('switcher server', () => {
     await app.inject({ method: 'GET', url: '/hls/ch1/playlist.m3u8' }); // learn the variant set
     const noVariant = await app.inject({ method: 'GET', url: '/hls/ch1/bogus/stream.m3u8' });
     expect(noVariant.statusCode).toBe(404);
+  });
+
+  it("segmentUrls 'upstream' serves media playlists with absolute upstream URLs (legacy shape)", async () => {
+    const legacyStitcher = new Stitcher({
+      cacheTtlMs: 2000,
+      stallGraceSec: 10,
+      segmentUrls: 'upstream',
+      fetchImpl: net.fetchImpl,
+      now: () => clock.nowMs,
+      logger: silent,
+    });
+    const legacyApp = buildServer({ stitcher: legacyStitcher, store, version: '0.0.0-test', nowMs: () => clock.nowMs });
+    try {
+      await legacyApp.inject({ method: 'PUT', url: '/v1/desired', payload: desiredDoc() });
+      const res = await legacyApp.inject({ method: 'GET', url: '/hls/ch1/1080p/stream.m3u8' });
+      expect(res.statusCode).toBe(200);
+      expect(res.body).toContain(`${NODE_A}/1080p/`);
+      expect(res.body).not.toContain('seg/');
+      // master stays relative in both modes
+      const master = await legacyApp.inject({ method: 'GET', url: '/hls/ch1/playlist.m3u8' });
+      expect(master.body).toContain('\n1080p/stream.m3u8');
+      expect(master.body).not.toContain('/hls/');
+    } finally {
+      await legacyApp.close();
+    }
+  });
+
+  it('GET /hls segment redirect answers 302 to the upstream with long-lived caching and CORS', async () => {
+    await putDesired(desiredDoc());
+    const res = await app.inject({ method: 'GET', url: '/hls/ch1/1080p/seg/p-b/20260101-000000.ts' });
+    expect(res.statusCode).toBe(302);
+    // any upstream in the channel resolves — not just the active one — so
+    // pre-failover cached playlists stay playable
+    expect(res.headers['location']).toBe(`${NODE_B}/1080p/20260101-000000.ts`);
+    expect(res.headers['cache-control']).toBe('public, max-age=86400');
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+  });
+
+  it('GET /hls segment redirect rejects traversal and unknown slug/upstream with 404', async () => {
+    await putDesired(desiredDoc());
+    const cases = [
+      '/hls/ch1/1080p/seg/p-a/%2e%2e%2fsecret.ts', // encoded ../ in the filename
+      '/hls/ch1/1080p/seg/p-a/..%2fsecret.ts',
+      '/hls/ch1/1080p/seg/p-a/..', // bare dot-dot
+      '/hls/ch1/1080p/seg/p-a/a%2fb.ts', // encoded slash
+      '/hls/ch1/%2e%2e/seg/p-a/x.ts', // traversal via the variant
+      '/hls/nope/1080p/seg/p-a/x.ts', // unknown slug
+      '/hls/ch1/1080p/seg/p-zzz/x.ts', // unknown upstream
+    ];
+    for (const url of cases) {
+      const res = await app.inject({ method: 'GET', url });
+      expect(res.statusCode, url).toBe(404);
+      expect(res.headers['location'], url).toBeUndefined();
+    }
   });
 
   it('GET /hls returns 503 with Retry-After when no upstream is available', async () => {
