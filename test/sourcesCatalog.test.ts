@@ -22,8 +22,8 @@ import { describe, expect, it } from 'vitest';
 import { type CatalogFs, type CatalogTimers, SourcesCatalog } from '../src/sources/catalog.js';
 import { silentLogger } from './support/fakes.js';
 
-const M3U_A = ['#EXTM3U', '#EXTINF:-1 tvg-id="a",Chan A', 'http://a/'].join('\n');
-const M3U_B = ['#EXTM3U', '#EXTINF:-1 tvg-id="b",Chan B', 'http://b/'].join('\n');
+const M3U_A = ['#EXTM3U', '#EXTINF:-1 tvg-id="a" tvg-chno="1",Chan A', 'http://a/'].join('\n');
+const M3U_B = ['#EXTM3U', '#EXTINF:-1 tvg-id="b" tvg-chno="2",Chan B', 'http://b/'].join('\n');
 
 interface FakeFile {
   fs: CatalogFs;
@@ -102,7 +102,7 @@ describe('SourcesCatalog', () => {
 
     const snap = catalog.snapshot();
     expect(snap.apiVersion).toBe(1);
-    expect(snap.entries).toEqual([{ id: 'a', name: 'Chan A', url: 'http://a/' }]);
+    expect(snap.entries).toEqual([{ id: 'a', name: 'Chan A', url: 'http://a/', chno: '1' }]);
     expect(snap.catalogHash).toBeTypeOf('string');
     expect(snap.updatedAt).toBe(new Date(1000).toISOString());
     expect(snap.warnings).toBeUndefined();
@@ -124,7 +124,7 @@ describe('SourcesCatalog', () => {
     await timers.tick();
 
     const after = catalog.snapshot();
-    expect(after.entries).toEqual([{ id: 'b', name: 'Chan B', url: 'http://b/' }]);
+    expect(after.entries).toEqual([{ id: 'b', name: 'Chan B', url: 'http://b/', chno: '2' }]);
     expect(after.catalogHash).not.toBe(before.catalogHash);
     expect(after.updatedAt).toBe(new Date(2000).toISOString());
     expect(catalog.hash).toBe(after.catalogHash);
@@ -183,7 +183,7 @@ describe('SourcesCatalog', () => {
     file.failReads = false;
     await timers.tick();
     const recovered = catalog.snapshot();
-    expect(recovered.entries).toEqual([{ id: 'b', name: 'Chan B', url: 'http://b/' }]);
+    expect(recovered.entries).toEqual([{ id: 'b', name: 'Chan B', url: 'http://b/', chno: '2' }]);
     expect(recovered.warnings).toBeUndefined();
   });
 
@@ -197,7 +197,7 @@ describe('SourcesCatalog', () => {
     await timers.tick();
 
     const snap = catalog.snapshot();
-    expect(snap.entries).toEqual([{ id: 'a', name: 'Chan A', url: 'http://a/' }]);
+    expect(snap.entries).toEqual([{ id: 'a', name: 'Chan A', url: 'http://a/', chno: '1' }]);
     expect(snap.warnings?.[0]).toMatch(/cannot stat sources catalog/);
   });
 

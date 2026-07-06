@@ -309,8 +309,12 @@ export const SourceCatalogEntry = Type.Object({
   url: Type.String({ minLength: 1 }),
   /** `tvg-logo` — emitted verbatim */
   logo: Type.Optional(Type.String()),
-  /** `tvg-chno` — STRING channel number, same identity conventions as tvheadend channel numbers ("9.1" ≠ "9.10") */
-  chno: Type.Optional(Type.String()),
+  /**
+   * `tvg-chno` — REQUIRED. Catalog entries are identity-matched by
+   * (name, chno); STRING channel number, same identity conventions as
+   * tvheadend channel numbers ("9.1" ≠ "9.10").
+   */
+  chno: Type.String({ minLength: 1 }),
 });
 export type SourceCatalogEntry = Static<typeof SourceCatalogEntry>;
 

@@ -31,6 +31,10 @@
  * from the display name. SET `tvg-id` FOR ID STABILITY: the controller
  * stores the id as `source_key`, so a name-derived id breaks the link when
  * the entry is renamed. Duplicate ids get `-2`, `-3`, … suffixes (warned).
+ *
+ * `tvg-chno` is REQUIRED: catalog entries are identity-matched by
+ * (name, chno). An `#EXTINF` without a non-empty `tvg-chno` is skipped
+ * with a warning.
  */
 
 import type { SourceCatalogEntry } from '../contract/v1.js';
@@ -108,6 +112,14 @@ export function parseM3u(text: string): ParseM3uResult {
       continue;
     }
 
+    const chno = attrs.get('tvg-chno')?.trim() ?? '';
+    if (chno === '') {
+      warnings.push(
+        `entry ${JSON.stringify(name)}: missing tvg-chno — skipped (entries are matched by name + tvg-chno)`,
+      );
+      continue;
+    }
+
     const tvgId = attrs.get('tvg-id')?.trim() ?? '';
     let id = tvgId !== '' ? tvgId : deriveSlug(name);
     if (id === '') {
@@ -126,13 +138,12 @@ export function parseM3u(text: string): ParseM3uResult {
     usedIds.add(id);
 
     const logo = attrs.get('tvg-logo') ?? '';
-    const chno = attrs.get('tvg-chno') ?? '';
     entries.push({
       id,
       name,
       url: line,
+      chno,
       ...(logo !== '' ? { logo } : {}),
-      ...(chno !== '' ? { chno } : {}),
     });
   }
 

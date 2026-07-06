@@ -84,7 +84,7 @@ beforeAll(async () => {
       '#EXTM3U',
       '#EXTINF:-1 tvg-id="ext-1" tvg-logo="http://logo/1.png" tvg-chno="9.1",External One',
       'https://ext.example/one/index.m3u8',
-      '#EXTINF:-1,External Two',
+      '#EXTINF:-1 tvg-chno="9.2",External Two',
       'https://ext.example/two/index.m3u8',
       '',
     ].join('\n'),
@@ -293,7 +293,7 @@ test.sequential('daemon e2e: GET /v1/sources serves the local catalog; status ca
       chno: '9.1',
     },
     // no tvg-id → slug of the display name
-    { id: 'external-two', name: 'External Two', url: 'https://ext.example/two/index.m3u8' },
+    { id: 'external-two', name: 'External Two', url: 'https://ext.example/two/index.m3u8', chno: '9.2' },
   ]);
 
   const statusBody = await pollStatus(() => true, 'status with sourcesHash');

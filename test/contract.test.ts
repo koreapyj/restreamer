@@ -158,13 +158,21 @@ describe('SourcesResponse', () => {
     chno: '9.1',
   };
 
-  it('accepts a full catalog entry and a minimal one', () => {
+  it('accepts a full catalog entry and a minimal one (chno required, logo optional)', () => {
     expect(Value.Check(SourceCatalogEntry, entry)).toBe(true);
-    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', url: 'http://x/' })).toBe(true);
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', url: 'http://x/', chno: '1' })).toBe(true);
   });
 
   it('rejects an entry missing url', () => {
-    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X' })).toBe(false);
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', chno: '1' })).toBe(false);
+  });
+
+  it('rejects an entry missing chno (entries are identity-matched by name + chno)', () => {
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', url: 'http://x/' })).toBe(false);
+  });
+
+  it('rejects an entry with an empty chno', () => {
+    expect(Value.Check(SourceCatalogEntry, { id: 'x', name: 'X', url: 'http://x/', chno: '' })).toBe(false);
   });
 
   it('accepts a populated response and a no-catalog response', () => {

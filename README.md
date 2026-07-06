@@ -53,7 +53,10 @@ https://cdn.example/news/index.m3u8
 
 Always set `tvg-id`: it is the entry's stable id (the controller stores it as
 `source_key`). Without it the id is derived from the display name, so renaming
-the entry breaks any channel pointing at it. `tvg-logo`/`tvg-chno` are
+the entry breaks any channel pointing at it. `tvg-chno` is REQUIRED — catalog
+entries are identity-matched by (name, `tvg-chno`), with the same STRING
+conventions as tvheadend channel numbers ("9.1" ≠ "9.10"); an `#EXTINF` line
+without a non-empty `tvg-chno` is skipped (with a warning). `tvg-logo` is
 optional and passed through verbatim; the display name is the text after the
 last comma of the `#EXTINF` line.
 
