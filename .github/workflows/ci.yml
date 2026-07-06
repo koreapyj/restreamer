@@ -1,5 +1,6 @@
 # CI: build + typecheck + hermetic test suite on every push and pull request.
-# Debian packaging and release publishing live in deb.yml.
+# Debian packaging, the switcher container image, and release publishing
+# live in release.yml.
 name: ci
 
 on:

@@ -119,6 +119,36 @@ To build the deb yourself on Linux:
    its SECURITY comment before choosing the bind address.
 5. `systemctl daemon-reload && systemctl enable --now restreamer`
 
+## Switcher deployment (Kubernetes)
+
+CI publishes the switcher container image to GHCR as
+`ghcr.io/<owner>/restreamer-switcher` (built from
+`deploy/switcher.Dockerfile`, pushed only after the shared test suite and an
+on-runner `/v1/healthz` smoke test pass; linux/amd64 only for now):
+
+| ref | image tags |
+|---|---|
+| tag `vX.Y.Z` | `:X.Y.Z`, `:latest` |
+| push to `main` | `:main`, `:main-<shortsha>` |
+| `workflow_dispatch` on a non-main ref | `:dev-<shortsha>` |
+
+Deploy runbook:
+
+1. Edit `deploy/k8s/switcher.yaml`: the Deployment `image:` (your GHCR owner
+   + a released version), the Ingress `host:` (must equal this switcher's
+   `publicUrl` in tvh-controller's `restreamer.switchers` block), and the
+   ConfigMap if you need non-default config. If the GHCR package stays
+   private (the default), add the `imagePullSecrets` — see the comment in
+   the manifest.
+2. `kubectl apply -f deploy/k8s/switcher.yaml`
+3. Verify: `kubectl port-forward svc/restreamer-switcher 8080:80`, then
+   `curl -fsS http://127.0.0.1:8080/v1/healthz`.
+4. Point tvh-controller at it: a `restreamer.switchers` entry whose `url` is
+   the in-cluster Service URL (`http://restreamer-switcher.<namespace>.svc`)
+   and whose `publicUrl` is the Ingress host. The controller pushes the
+   desired doc from there; only `/hls` may be exposed publicly (the `/v1`
+   API is unauthenticated by contract — see the manifest's SECURITY note).
+
 ## Migration from the per-channel systemd units
 
 Viewer URLs never change: a session named `<name>` writes to the same

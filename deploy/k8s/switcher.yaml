@@ -57,10 +57,20 @@ spec:
       # the image runs as USER node (uid 1000); make the PVC writable for it
       securityContext:
         fsGroup: 1000
+      # GHCR packages are PRIVATE by default. Either make the package public
+      # (GitHub -> Packages -> restreamer-switcher -> package settings), or
+      # create a pull secret and uncomment imagePullSecrets:
+      #   kubectl create secret docker-registry ghcr-pull \
+      #     --docker-server=ghcr.io --docker-username=<github-user> \
+      #     --docker-password=<PAT with read:packages scope>
+      # imagePullSecrets:
+      #   - name: ghcr-pull
       containers:
         - name: switcher
-          # placeholder — point at your registry build of deploy/switcher.Dockerfile
-          image: ghcr.io/koreapyj/restreamer-switcher:latest
+          # CI publishes this image (.github/workflows/release.yml):
+          #   tag vX.Y.Z -> :X.Y.Z and :latest; main -> :main and :main-<sha>
+          image: ghcr.io/koreapyj/restreamer-switcher:0.1.0 # ← set your owner + a released version
+          imagePullPolicy: IfNotPresent
           env:
             - name: SWITCHER_CONFIG
               value: /etc/restreamer/switcher.yaml
