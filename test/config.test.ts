@@ -81,6 +81,16 @@ cleanupOnRemove: false
     expect(loadConfig(path).sourcesM3u).toBeNull();
   });
 
+  it('accepts an explicit tvhBaseUrl null (no-tvheadend host)', () => {
+    const path = writeConfig('tvhBaseUrl: null\n');
+    expect(loadConfig(path).tvhBaseUrl).toBeNull();
+  });
+
+  it('defaults tvhBaseUrl to the production value when omitted', () => {
+    const path = writeConfig('');
+    expect(loadConfig(path).tvhBaseUrl).toBe('http://127.0.0.1:9981');
+  });
+
   it('resolves the config path from $RESTREAMER_CONFIG', () => {
     const path = writeConfig('listen: { port: 7700 }\n');
     process.env.RESTREAMER_CONFIG = path;

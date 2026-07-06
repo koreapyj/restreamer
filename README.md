@@ -25,7 +25,7 @@ production values); see `config.example.yaml` for the commented version.
 | `listen.host` / `listen.port` | `0.0.0.0` / `5580` | HTTP API bind (unauthenticated — LAN/VPN only, see SECURITY note in `deploy/restreamer.service`) |
 | `serveDir` | `/media` | HLS output root; each session writes `<serveDir>/<name>/` |
 | `stateFile` | `/var/lib/restreamer/desired.json` | atomic persistence of the accepted desired doc |
-| `tvhBaseUrl` | `http://127.0.0.1:9981` | local tvheadend; sessions stream `/stream/channel/<uuid>` |
+| `tvhBaseUrl` | `http://127.0.0.1:9981` | local tvheadend; sessions stream `/stream/channel/<uuid>`; `null` = this host has no tvheadend (external/m3u-only zone) — tvh-source sessions are then rejected all-or-nothing by `PUT /v1/desired`, url-source sessions unaffected |
 | `sourcesM3u` | `null` | local M3U catalog of external (non-tvheadend) sources, served as `GET /v1/sources`; `null` = no catalog |
 | `defaultWeight` | `100` | tvh subscription weight when a session doesn't set one |
 | `ffmpegPath` / `tsreadexPath` | `ffmpeg` / `tsreadex` | child binaries |
@@ -51,14 +51,15 @@ catalog. Format:
 https://cdn.example/news/index.m3u8
 ```
 
-Always set `tvg-id`: it is the entry's stable id (the controller stores it as
-`source_key`). Without it the id is derived from the display name, so renaming
-the entry breaks any channel pointing at it. `tvg-chno` is REQUIRED — catalog
-entries are identity-matched by (name, `tvg-chno`), with the same STRING
-conventions as tvheadend channel numbers ("9.1" ≠ "9.10"); an `#EXTINF` line
-without a non-empty `tvg-chno` is skipped (with a warning). `tvg-logo` is
-optional and passed through verbatim; the display name is the text after the
-last comma of the `#EXTINF` line.
+Catalog entries are identity-matched by (name, `tvg-chno`) — the same rules as
+tvheadend channels, so the display name must exactly match the tvheadend
+channel name (full-width characters included) for a channel to merge across
+tvh and m3u zones. `tvg-chno` is REQUIRED, with the same STRING conventions as
+tvheadend channel numbers ("9.1" ≠ "9.10"); an `#EXTINF` line without a
+non-empty `tvg-chno` is skipped (with a warning). `tvg-id` is optional (a
+stable entry id, used as the playlist `tvg-id` when a channel resolves from
+the catalog); `tvg-logo` is optional and passed through verbatim. The display
+name is the text after the last comma of the `#EXTINF` line.
 
 ## HTTP API (wire contract v1)
 

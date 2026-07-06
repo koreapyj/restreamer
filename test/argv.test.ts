@@ -375,6 +375,23 @@ describe('source resolution', () => {
       'http://127.0.0.1:9981/stream/channel/u1?profile=pass&weight=42',
     );
   });
+
+  it('tvhBaseUrl: null rejects a tvh-source session with a clear message', () => {
+    const session = atXSession();
+    session.source = { channelUuid: 'u1' };
+    expect(() => buildPipeline(session, { ...ctx, tvhBaseUrl: null })).toThrow(
+      'session "at-x": tvheadend source requires tvhBaseUrl, but this daemon has tvhBaseUrl: null (external sources only)',
+    );
+    expect(() => buildPipeline(session, { ...ctx, tvhBaseUrl: null })).toThrow(PipelineBuildError);
+  });
+
+  it('tvhBaseUrl: null still builds a url-source session fine', () => {
+    const session = atXSession();
+    session.source = { url: 'http://example.local/stream.ts?token=x' };
+    expect(buildPipeline(session, { ...ctx, tvhBaseUrl: null }).sourceUrl).toBe(
+      'http://example.local/stream.ts?token=x',
+    );
+  });
 });
 
 describe('rejection', () => {

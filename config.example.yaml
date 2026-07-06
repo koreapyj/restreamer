@@ -18,6 +18,9 @@ serveDir: /media
 stateFile: /var/lib/restreamer/desired.json
 
 # Local tvheadend instance; sessions stream /stream/channel/<uuid> from here.
+# null = this host has no tvheadend (external/m3u-only zone) -- tvh-source
+# sessions are then rejected all-or-nothing by PUT /v1/desired; url-source
+# sessions are unaffected.
 tvhBaseUrl: http://127.0.0.1:9981
 
 # Local M3U catalog of external (non-tvheadend) sources, exposed to the

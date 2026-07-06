@@ -30,8 +30,8 @@ import { buildTsreadexArgv } from './tsreadex.js';
 export interface BuildCtx {
   /** HLS output root; session writes to `<serveDir>/<name>/` */
   serveDir: string;
-  /** local tvheadend base URL, no trailing slash */
-  tvhBaseUrl: string;
+  /** local tvheadend base URL, no trailing slash; null = this host has no tvheadend (url-source sessions only) */
+  tvhBaseUrl: string | null;
   /** subscription weight when the session doesn't specify one */
   defaultWeight: number;
   /** enable ffmpeg `-progress pipe:3` (session layer sets this; dry runs don't) */
@@ -73,6 +73,12 @@ export function buildPipeline(session: DesiredSession, ctx: BuildCtx): BuiltPipe
 
   const template = getTemplate(filled.pipeline);
   const outDir = `${ctx.serveDir}/${filled.name}`;
+  if (!('url' in filled.source) && ctx.tvhBaseUrl === null) {
+    throw new PipelineBuildError(
+      `session "${filled.name}": tvheadend source requires tvhBaseUrl, but this daemon has tvhBaseUrl: null (external sources only)`,
+      [],
+    );
+  }
   const sourceUrl =
     'url' in filled.source
       ? filled.source.url

@@ -38,8 +38,12 @@ export const DaemonConfigSchema = Type.Object({
   serveDir: Type.String({ default: '/media' }),
   /** atomic JSON persistence of the accepted desired doc */
   stateFile: Type.String({ default: '/var/lib/restreamer/desired.json' }),
-  /** local tvheadend instance the daemon subscribes to */
-  tvhBaseUrl: Type.String({ default: 'http://127.0.0.1:9981' }),
+  /**
+   * local tvheadend instance the daemon subscribes to; null = this host has
+   * no tvheadend — only url-source sessions are accepted (tvh-source
+   * sessions are rejected by buildPipeline / PUT /v1/desired)
+   */
+  tvhBaseUrl: Type.Union([Type.String({ minLength: 1 }), Type.Null()], { default: 'http://127.0.0.1:9981' }),
   /**
    * local M3U catalog of external (non-tvheadend) sources, exposed via
    * `GET /v1/sources` (e.g. /etc/restreamer/sources.m3u); null = no catalog
@@ -89,5 +93,5 @@ export function loadConfig(path = defaultConfigPath()): DaemonConfig {
       .join('; ');
     throw new Error(`invalid config ${path}: ${details}`);
   }
-  return { ...config, tvhBaseUrl: config.tvhBaseUrl.replace(/\/+$/, '') };
+  return { ...config, tvhBaseUrl: config.tvhBaseUrl === null ? null : config.tvhBaseUrl.replace(/\/+$/, '') };
 }
