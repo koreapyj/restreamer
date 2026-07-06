@@ -27,10 +27,12 @@
  * (EXTINF without URL, URL without EXTINF) are skipped with a warning —
  * one bad entry never poisons the catalog.
  *
- * Entry `id` = the `tvg-id` attribute when non-empty, else a slug derived
- * from the display name. SET `tvg-id` FOR ID STABILITY: the controller
- * stores the id as `source_key`, so a name-derived id breaks the link when
- * the entry is renamed. Duplicate ids get `-2`, `-3`, … suffixes (warned).
+ * Entry `id` is auto-assigned (like tvheadend assigns channel uuids):
+ * the `tvg-id` attribute when non-empty, else a stable hash of the entry
+ * URL. Identity matching uses (name, chno) — never the id; it only names
+ * the entry in the API and is re-emitted as the playlist `tvg-id` when a
+ * channel resolves from the catalog, so set an explicit `tvg-id` only if
+ * your EPG XML is keyed by it.
  *
  * `tvg-chno` is REQUIRED: catalog entries are identity-matched by
  * (name, chno). An `#EXTINF` without a non-empty `tvg-chno` is skipped
@@ -38,6 +40,7 @@
  */
 
 import type { SourceCatalogEntry } from '../contract/v1.js';
+import { stableHash } from '../util/hash.js';
 
 export interface ParseM3uResult {
   entries: SourceCatalogEntry[];
@@ -46,23 +49,6 @@ export interface ParseM3uResult {
 }
 
 const ATTR_PATTERN = /([\w-]+)="([^"]*)"/g;
-
-/**
- * Slug derivation for entries without a `tvg-id` (same rules as the
- * controller's channel slugs): lowercase, runs of anything outside
- * [a-z0-9-] collapse to '-', leading/trailing '-' trimmed (so it starts
- * alphanumeric), capped at 64 chars. Returns '' when nothing sluggable
- * remains (e.g. a name of only symbols or non-Latin characters).
- */
-function deriveSlug(name: string): string {
-  let slug = name
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+/, '')
-    .replace(/-+$/, '');
-  if (slug.length > 64) slug = slug.slice(0, 64).replace(/-+$/, '');
-  return slug;
-}
 
 interface PendingExtinf {
   lineNo: number;
@@ -73,7 +59,6 @@ interface PendingExtinf {
 export function parseM3u(text: string): ParseM3uResult {
   const entries: SourceCatalogEntry[] = [];
   const warnings: string[] = [];
-  const usedIds = new Set<string>();
   let pending: PendingExtinf | null = null;
 
   const lines = text.split(/\r?\n/); // CRLF-tolerant
@@ -120,22 +105,11 @@ export function parseM3u(text: string): ParseM3uResult {
       continue;
     }
 
+    // Auto-assigned id (never used for matching): explicit tvg-id, else a
+    // stable hash of the URL — deterministic across reloads, no derivation
+    // failures regardless of the name's script.
     const tvgId = attrs.get('tvg-id')?.trim() ?? '';
-    let id = tvgId !== '' ? tvgId : deriveSlug(name);
-    if (id === '') {
-      warnings.push(
-        `line ${extinfLine}: cannot derive an id from name ${JSON.stringify(name)} — set tvg-id; entry skipped`,
-      );
-      continue;
-    }
-    if (usedIds.has(id)) {
-      const base = id;
-      for (let n = 2; usedIds.has(id); n++) id = `${base}-${n}`;
-      warnings.push(
-        `line ${extinfLine}: duplicate id ${JSON.stringify(base)} — renamed to ${JSON.stringify(id)}; set a unique tvg-id`,
-      );
-    }
-    usedIds.add(id);
+    const id = tvgId !== '' ? tvgId : stableHash(line).slice(0, 16);
 
     const logo = attrs.get('tvg-logo') ?? '';
     entries.push({

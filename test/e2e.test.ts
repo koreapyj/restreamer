@@ -44,6 +44,7 @@ import { type DesiredSession, type DesiredState, SourcesResponse, StatusResponse
 import { buildPipeline } from '../src/pipeline/build.js';
 import { SourcesCatalog } from '../src/sources/catalog.js';
 import { DesiredStore } from '../src/state/desiredStore.js';
+import { stableHash } from '../src/util/hash.js';
 import { Supervisor } from '../src/supervise/supervisor.js';
 import { VERSION } from '../src/version.js';
 import { silentLogger } from './support/fakes.js';
@@ -292,8 +293,13 @@ test.sequential('daemon e2e: GET /v1/sources serves the local catalog; status ca
       logo: 'http://logo/1.png',
       chno: '9.1',
     },
-    // no tvg-id → slug of the display name
-    { id: 'external-two', name: 'External Two', url: 'https://ext.example/two/index.m3u8', chno: '9.2' },
+    // no tvg-id → stable hash of the URL
+    {
+      id: stableHash('https://ext.example/two/index.m3u8').slice(0, 16),
+      name: 'External Two',
+      url: 'https://ext.example/two/index.m3u8',
+      chno: '9.2',
+    },
   ]);
 
   const statusBody = await pollStatus(() => true, 'status with sourcesHash');

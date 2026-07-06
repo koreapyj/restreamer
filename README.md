@@ -56,10 +56,12 @@ tvheadend channels, so the display name must exactly match the tvheadend
 channel name (full-width characters included) for a channel to merge across
 tvh and m3u zones. `tvg-chno` is REQUIRED, with the same STRING conventions as
 tvheadend channel numbers ("9.1" ≠ "9.10"); an `#EXTINF` line without a
-non-empty `tvg-chno` is skipped (with a warning). `tvg-id` is optional (a
-stable entry id, used as the playlist `tvg-id` when a channel resolves from
-the catalog); `tvg-logo` is optional and passed through verbatim. The display
-name is the text after the last comma of the `#EXTINF` line.
+non-empty `tvg-chno` is skipped (with a warning). `tvg-id` is optional —
+entry ids are auto-assigned (explicit `tvg-id`, else a stable hash of the
+URL) and are re-emitted as the playlist `tvg-id` when a channel resolves
+from the catalog, so set one only if your EPG XML is keyed by it.
+`tvg-logo` is optional and passed through verbatim. The display name is the
+text after the last comma of the `#EXTINF` line.
 
 ## HTTP API (wire contract v1)
 

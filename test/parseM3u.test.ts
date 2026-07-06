@@ -95,65 +95,43 @@ describe('parseM3u', () => {
     expect(entries[0]?.name).toBe('World');
   });
 
-  it('derives the id from the name when tvg-id is missing or empty (slug rules)', () => {
+  it('auto-derives the id from a URL hash when tvg-id is missing or empty — any script, no warnings', () => {
     const { entries, warnings } = parseM3u(
       [
-        '#EXTINF:-1 tvg-chno="1",AT-X HD!',
-        'http://a/',
-        '#EXTINF:-1 tvg-id="" tvg-chno="2",  --Foo   Bar 2--  ',
-        'http://b/',
+        '#EXTINF:-1 tvg-chno="9.1",日本語チャンネル',
+        'http://jp/',
+        '#EXTINF:-1 tvg-id="" tvg-chno="9.2",ＮＨＫ総合１・東京',
+        'http://nhk/',
       ].join('\n'),
     );
     expect(warnings).toEqual([]);
-    expect(entries.map((e) => e.id)).toEqual(['at-x-hd', 'foo-bar-2']);
+    expect(entries).toHaveLength(2);
+    for (const e of entries) expect(e.id).toMatch(/^[0-9a-f]{16}$/);
+    expect(entries[0]?.name).toBe('日本語チャンネル');
+    expect(entries[0]?.id).not.toBe(entries[1]?.id);
   });
 
-  it('caps derived ids at 64 chars without a trailing hyphen', () => {
-    const name = `${'a'.repeat(63)} tail`;
-    const { entries } = parseM3u([`#EXTINF:-1 tvg-chno="1",${name}`, 'http://long/'].join('\n'));
-    const id = entries[0]?.id ?? '';
-    expect(id).toBe('a'.repeat(63));
-    expect(id.length).toBeLessThanOrEqual(64);
-    expect(id.endsWith('-')).toBe(false);
+  it('derived ids are stable: the same URL always hashes to the same id', () => {
+    const doc = ['#EXTINF:-1 tvg-chno="1",Whatever Name', 'http://stable/'].join('\n');
+    const a = parseM3u(doc).entries[0]?.id;
+    const renamed = parseM3u(
+      ['#EXTINF:-1 tvg-chno="1",Renamed Entry', 'http://stable/'].join('\n'),
+    ).entries[0]?.id;
+    expect(a).toMatch(/^[0-9a-f]{16}$/);
+    expect(renamed).toBe(a); // id follows the URL, not the display name
   });
 
-  it('skips an entry whose id cannot be derived (non-sluggable name, no tvg-id)', () => {
-    const { entries, warnings } = parseM3u(
-      ['#EXTINF:-1 tvg-chno="1",日本語チャンネル', 'http://jp/'].join('\n'),
-    );
-    expect(entries).toEqual([]);
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatch(/cannot derive an id .* set tvg-id/);
-  });
-
-  it('suffixes duplicate ids with -2, -3 and warns', () => {
+  it('an explicit tvg-id passes through verbatim (even duplicated)', () => {
     const { entries, warnings } = parseM3u(
       [
         '#EXTINF:-1 tvg-id="dup" tvg-chno="1",First',
         'http://1/',
         '#EXTINF:-1 tvg-id="dup" tvg-chno="2",Second',
         'http://2/',
-        '#EXTINF:-1 tvg-id="dup" tvg-chno="3",Third',
-        'http://3/',
       ].join('\n'),
     );
-    expect(entries.map((e) => e.id)).toEqual(['dup', 'dup-2', 'dup-3']);
-    expect(warnings).toHaveLength(2);
-    expect(warnings[0]).toMatch(/duplicate id "dup".*"dup-2"/);
-    expect(warnings[1]).toMatch(/duplicate id "dup".*"dup-3"/);
-  });
-
-  it('suffixes duplicate DERIVED ids too (two entries slugging to the same name)', () => {
-    const { entries, warnings } = parseM3u(
-      [
-        '#EXTINF:-1 tvg-chno="1",My Channel',
-        'http://1/',
-        '#EXTINF:-1 tvg-chno="2",My  Channel!',
-        'http://2/',
-      ].join('\n'),
-    );
-    expect(entries.map((e) => e.id)).toEqual(['my-channel', 'my-channel-2']);
-    expect(warnings).toHaveLength(1);
+    expect(entries.map((e) => e.id)).toEqual(['dup', 'dup']);
+    expect(warnings).toEqual([]);
   });
 
   it('warns and skips an #EXTINF with no following URL', () => {
