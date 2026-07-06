@@ -1,0 +1,170 @@
+# Debian packaging for the restreamer DAEMON (the switcher ships as a
+# container image — deploy/switcher.Dockerfile — and is not packaged here).
+#
+# Version scheme (package.json is the source of truth for the code-reported
+# version, so the tag must agree with it):
+#   tag vX.Y.Z      -> deb version X.Y.Z; the job FAILS if the tag does not
+#                      match package.json "version"
+#   push to main /  -> deb version <pkgver>~git<run_number>.<shortsha>
+#   workflow_dispatch  ('~' sorts before the release, so the next real
+#                      X.Y.Z upgrades over any rolling build)
+#
+# Publishing:
+#   tag vX.Y.Z   -> deb attached to the GitHub release for that tag
+#   push to main -> deb attached to the rolling 'main-latest' prerelease
+#                   (recreated each time so old assets don't pile up)
+# Every run also uploads the deb as a workflow artifact.
+name: deb
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest # amd64: the deb bundles the linux-x64 Node runtime
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      # pnpm version comes from package.json "packageManager"
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 26
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # the full suite must pass before anything is packaged
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      - name: Compute deb version
+        id: version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "$TAG_VERSION" != "$PKG_VERSION" ]]; then
+              echo "::error::tag v$TAG_VERSION does not match package.json version $PKG_VERSION — bump package.json (the daemon reports it in /v1/status) and re-tag"
+              exit 1
+            fi
+            VERSION="$PKG_VERSION"
+          else
+            VERSION="${PKG_VERSION}~git${GITHUB_RUN_NUMBER}.${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build deb
+        run: bash scripts/build-deb.sh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Smoke-test deb on the runner
+        run: |
+          set -euxo pipefail
+          sudo dpkg -i out/*.deb
+
+          # CI config: keep serveDir under the state dir the package owns
+          # (the installed conffile defaults to /media, absent on the runner)
+          sudo install -d -o restreamer -g restreamer /var/lib/restreamer/ci-media
+          sudo tee /etc/restreamer/ci-smoke.yaml >/dev/null <<'EOF'
+          listen:
+            host: 127.0.0.1
+            port: 5580
+          serveDir: /var/lib/restreamer/ci-media
+          EOF
+          sudo mkdir -p /etc/systemd/system/restreamer.service.d
+          sudo tee /etc/systemd/system/restreamer.service.d/ci.conf >/dev/null <<'EOF'
+          [Service]
+          Environment=RESTREAMER_CONFIG=/etc/restreamer/ci-smoke.yaml
+          EOF
+          sudo systemctl daemon-reload
+
+          sudo systemctl start restreamer
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5580/v1/healthz; then ok=1; break; fi
+            sleep 1
+          done
+          echo
+          if [[ "$ok" != 1 ]]; then
+            sudo systemctl status restreamer --no-pager || true
+            sudo journalctl -u restreamer --no-pager | tail -n 50
+            exit 1
+          fi
+          sudo systemctl status restreamer --no-pager
+          systemctl is-active --quiet restreamer
+
+          sudo systemctl stop restreamer
+          sudo rm -rf /etc/systemd/system/restreamer.service.d
+          sudo dpkg -r restreamer
+          ! systemctl is-active --quiet restreamer
+          if dpkg -s restreamer 2>/dev/null | grep -q 'Status: install ok installed'; then
+            echo '::error::restreamer still installed after dpkg -r'
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: restreamer-deb
+          path: out/*.deb
+          if-no-files-found: warn
+
+  release:
+    # proper release: attach the deb to the GitHub release for the tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: restreamer-deb
+          path: out
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          files: out/*.deb
+          generate_release_notes: true
+
+  prerelease:
+    # rolling prerelease: recreate the fixed 'main-latest' tag/release so it
+    # always carries exactly the newest main build
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: main-latest-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: restreamer-deb
+          path: out
+      - name: Drop previous rolling release
+        run: gh release delete main-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: main-latest
+          name: Rolling build (main)
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: |
+            Automated rolling build of `main` (${{ github.sha }}),
+            version `${{ needs.build.outputs.version }}`.
+            Superseded by every push to main; prefer tagged releases.
+          files: out/*.deb

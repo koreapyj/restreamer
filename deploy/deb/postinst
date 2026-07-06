@@ -1,0 +1,52 @@
+#!/bin/sh
+# restreamer - HLS restreaming daemon and switcher for tvheadend
+# Copyright (C) 2026 Yoonji Park
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or any
+# later version. This program is distributed WITHOUT ANY WARRANTY; see
+# <https://www.gnu.org/licenses/> for details.
+#
+# postinst: create the 'restreamer' system user, own the state dir, reload
+# systemd, and restart the service on upgrades if it was running. The
+# service is deliberately NOT enabled/started on fresh install: the admin
+# must first review /etc/restreamer/config.yaml and serveDir permissions.
+set -e
+
+case "$1" in
+  configure)
+    if ! getent passwd restreamer >/dev/null; then
+      adduser --quiet --system --group \
+        --home /var/lib/restreamer --no-create-home restreamer
+    fi
+
+    # stateFile default is /var/lib/restreamer/desired.json
+    mkdir -p /var/lib/restreamer
+    chown restreamer:restreamer /var/lib/restreamer
+    chmod 0750 /var/lib/restreamer
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+      # $2 = previously configured version, i.e. this is an upgrade: restart
+      # the daemon if it was running so it picks up the new code.
+      if [ -n "$2" ] && systemctl is-active --quiet restreamer.service; then
+        systemctl restart restreamer.service || true
+      fi
+    fi
+
+    if [ -z "$2" ]; then
+      cat <<'EOF'
+restreamer: fresh install
+  1. edit /etc/restreamer/config.yaml (a commented default was installed;
+     it is a conffile - your edits survive upgrades)
+  2. serveDir (default /media) must exist and be writable by the
+     'restreamer' user: grant permissions, or override User=/Group= via
+     'systemctl edit restreamer' (read the SECURITY note in the unit first)
+  3. systemctl enable --now restreamer
+EOF
+    fi
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,34 @@
+#!/bin/sh
+# restreamer - HLS restreaming daemon and switcher for tvheadend
+# Copyright (C) 2026 Yoonji Park
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or any
+# later version. This program is distributed WITHOUT ANY WARRANTY; see
+# <https://www.gnu.org/licenses/> for details.
+#
+# postrm: reload systemd after the unit file is gone; on purge, drop the
+# persisted desired-state under /var/lib/restreamer. serveDir (HLS output,
+# e.g. /media) is admin-owned viewer content and is NEVER touched here.
+set -e
+
+case "$1" in
+  remove|purge)
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+if [ "$1" = "purge" ]; then
+  rm -rf /var/lib/restreamer
+  # enablement symlink left behind by a manual 'systemctl enable'
+  rm -f /etc/systemd/system/multi-user.target.wants/restreamer.service
+  # dpkg removes the conffile itself on purge; clear the dir if now empty
+  rmdir --ignore-fail-on-non-empty /etc/restreamer 2>/dev/null || true
+  # The 'restreamer' system user is intentionally kept (Debian convention:
+  # files elsewhere, e.g. under serveDir, may still be owned by it).
+fi
+
+exit 0

@@ -1,0 +1,26 @@
+# switcher configuration
+#
+# Lookup order: $SWITCHER_CONFIG -> ./switcher.yaml -> /etc/restreamer/switcher.yaml
+# Every key is optional; an empty file yields the defaults shown below.
+
+# HTTP bind address. /v1 is unauthenticated by contract — expose only /hls
+# publicly (see deploy/k8s/switcher.yaml).
+listen:
+  host: 0.0.0.0
+  port: 5590
+
+# Persisted desired doc + active-selection map (one atomic JSON file; on
+# Kubernetes this path is PVC-backed so restarts keep serving state).
+stateFile: /var/lib/switcher/desired.json
+
+# Upstream playlist fetches are micro-cached per (channel, variant, upstream)
+# for this long — load scales with actual viewers, not request rate.
+cacheTtlMs: 2000
+
+# Background health probe period: all upstreams of all channels are checked
+# so unwatched channels still fail over and failover targets are known-healthy.
+probeIntervalMs: 15000
+
+# An upstream is stale (unhealthy) when its media playlist's PROGRAM-DATE-TIME
+# lags wall clock by more than 3 x segmentSeconds + stallGraceSec.
+stallGraceSec: 10

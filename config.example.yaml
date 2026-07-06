@@ -1,0 +1,56 @@
+# restreamer daemon configuration
+#
+# Lookup order: $RESTREAMER_CONFIG -> ./config.yaml -> /etc/restreamer/config.yaml
+# Every key is optional; an empty file yields the defaults shown below
+# (which match current production).
+
+# HTTP API bind address. Unauthenticated by contract — LAN-isolated only,
+# same trust model as `rclone rcd --rc-no-auth`.
+listen:
+  host: 0.0.0.0
+  port: 5580
+
+# HLS output root; each session writes to <serveDir>/<name>/ (served by nginx).
+serveDir: /media
+
+# Persisted desired-state doc (atomic tmp+rename). The daemon reconciles from
+# this at startup with zero controller involvement.
+stateFile: /var/lib/restreamer/desired.json
+
+# Local tvheadend instance; sessions stream /stream/channel/<uuid> from here.
+tvhBaseUrl: http://127.0.0.1:9981
+
+# Subscription weight used when a session's source doesn't specify one
+# (tvheadend preempts by weight; DVR wins).
+defaultWeight: 100
+
+# Child binaries.
+ffmpegPath: ffmpeg
+tsreadexPath: tsreadex
+
+# Hardware capabilities advertised in /v1/status — the controller matches
+# these against each pipeline template's requiredCaps.
+capabilities:
+  - qsv
+  - opencl
+
+# Per-session stderr ring-buffer size (GET /v1/sessions/:name/log).
+logLines: 500
+
+# No ffmpeg -progress update for this long while running -> restart, class 'stall'.
+stallTimeoutSec: 30
+
+# Playlist watchdog: restart when the media playlist's PROGRAM-DATE-TIME lags
+# wall clock by more than this. null = derive per session (3 x hls_time + 15s).
+playlistStallSec: null
+
+# Proactive memory guard: if ffmpeg+tsreadex RSS exceeds this, restart the
+# session (class 'oom-guard', failure counter reset). null = disabled.
+memoryLimitMb: 2048
+
+# Graceful stop: abort source -> wait this many seconds for ffmpeg to flush
+# and exit -> SIGTERM -> SIGKILL after 5 more seconds.
+stopGraceSec: 10
+
+# Delete <serveDir>/<name>/ when a session is removed from the desired doc.
+cleanupOnRemove: true

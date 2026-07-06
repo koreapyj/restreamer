@@ -1,0 +1,8 @@
+.claude
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+out/
+config.yaml
+package-lock.json

@@ -1,0 +1,23 @@
+#!/bin/sh
+# restreamer - HLS restreaming daemon and switcher for tvheadend
+# Copyright (C) 2026 Yoonji Park
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or any
+# later version. This program is distributed WITHOUT ANY WARRANTY; see
+# <https://www.gnu.org/licenses/> for details.
+#
+# prerm: stop the daemon before its files are removed. On upgrade ($1 =
+# "upgrade") the service keeps running; postinst restarts it afterwards.
+set -e
+
+case "$1" in
+  remove)
+    if [ -d /run/systemd/system ]; then
+      systemctl stop restreamer.service || true
+    fi
+    ;;
+esac
+
+exit 0

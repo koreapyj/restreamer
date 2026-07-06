@@ -1,0 +1,123 @@
+# Switcher deployment — HLS failover/splice service (see src/switcher/).
+#
+# Singleton by design: the active-selection state is per-process, so keep
+# replicas at 1 with strategy Recreate (also required by the RWO PVC);
+# Kubernetes rescheduling is the standby story. If the PVC is ever lost the
+# switcher boots empty and reports desiredRevision: null — the controller's
+# status poll re-pushes immediately.
+#
+# SECURITY: the /v1 control API is unauthenticated by contract. Only the
+# viewer-facing /hls path may be exposed through the Ingress; /v1 must stay
+# cluster-internal (and ideally be limited to the controller with a
+# NetworkPolicy, as for tvh-controller).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: switcher-config
+data:
+  # mounted at /etc/restreamer/switcher.yaml; $SWITCHER_CONFIG points here
+  # (defaults shown — see switcher.example.yaml for the annotated version)
+  switcher.yaml: |
+    listen:
+      host: 0.0.0.0
+      port: 5590
+    stateFile: /var/lib/switcher/desired.json
+    cacheTtlMs: 2000
+    probeIntervalMs: 15000
+    stallGraceSec: 10
+---
+# Desired doc + active-selection map survive pod restarts/rescheduling here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: switcher-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: restreamer-switcher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: restreamer-switcher
+  template:
+    metadata:
+      labels:
+        app: restreamer-switcher
+    spec:
+      # the image runs as USER node (uid 1000); make the PVC writable for it
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: switcher
+          # placeholder — point at your registry build of deploy/switcher.Dockerfile
+          image: ghcr.io/koreapyj/restreamer-switcher:latest
+          env:
+            - name: SWITCHER_CONFIG
+              value: /etc/restreamer/switcher.yaml
+          ports:
+            - containerPort: 5590
+          volumeMounts:
+            - name: config
+              mountPath: /etc/restreamer
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/switcher
+          livenessProbe:
+            httpGet: { path: /v1/healthz, port: 5590 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /v1/healthz, port: 5590 }
+      volumes:
+        - name: config
+          configMap:
+            name: switcher-config
+        - name: state
+          persistentVolumeClaim:
+            claimName: switcher-state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: restreamer-switcher
+spec:
+  selector:
+    app: restreamer-switcher
+  ports:
+    - port: 80
+      targetPort: 5590
+---
+# Ingress skeleton. The host below must equal the `publicUrl` configured for
+# this switcher in tvh-controller's `restreamer.switchers` block — redundant
+# channels' M3U entries point at <publicUrl>/hls/<slug>/playlist.m3u8.
+# Only /hls is routed; never expose /v1 publicly (unauthenticated API).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: restreamer-switcher
+  # annotations:
+  #   cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  rules:
+    - host: switcher.example.com # placeholder — set to the switcher publicUrl host
+      http:
+        paths:
+          - path: /hls
+            pathType: Prefix
+            backend:
+              service:
+                name: restreamer-switcher
+                port:
+                  number: 80
+  # tls:
+  #   - hosts: [switcher.example.com]
+  #     secretName: restreamer-switcher-tls

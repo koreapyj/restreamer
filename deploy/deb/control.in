@@ -1,0 +1,20 @@
+Package: restreamer
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Yoonji Park <koreapyj0@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: libc6 (>= 2.28), libstdc++6, libgcc-s1, adduser
+Section: video
+Priority: optional
+Description: HLS restreaming daemon for tvheadend hosts (tvh-controller)
+ Supervises source -> tsreadex -> ffmpeg encoding sessions that turn local
+ tvheadend channels into browser-playable HLS under serveDir, controlled by
+ tvh-controller pushing desired-state documents over an unauthenticated,
+ LAN-isolated HTTP API. Desired state is persisted locally, so sessions
+ survive controller outages and daemon restarts.
+ .
+ Self-contained: bundles its own Node.js runtime under
+ /usr/lib/restreamer/runtime (hence Architecture: amd64); no system Node.js
+ is required. ffmpeg and tsreadex are NOT bundled and must be provided by
+ the host. The repo's second deployable (the switcher) is not part of this
+ package; it ships as a container image (deploy/switcher.Dockerfile).

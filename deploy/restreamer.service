@@ -1,0 +1,45 @@
+# restreamer HLS daemon (one per tvheadend host) for tvh-controller.
+# Install on each tvheadend host:
+#   1. install Node.js >= 22 so /usr/bin/node exists
+#   2. deploy the built app to /opt/restreamer
+#      (package.json + dist/ + production node_modules)
+#   3. place /etc/restreamer/config.yaml (start from config.example.yaml)
+#   4. copy this file to /etc/systemd/system/restreamer.service and edit
+#      User/Group below
+#   5. systemctl daemon-reload && systemctl enable --now restreamer
+#
+# SECURITY: the daemon's HTTP API is UNAUTHENTICATED by contract — any host
+# that can reach listen.host:listen.port can replace the desired state and
+# thereby start/stop arbitrary tvheadend subscriptions and ffmpeg processes
+# and write under serveDir, with no credentials and no authorization checks.
+# This is only safe because listen.host is bound to an interface that is
+# reachable exclusively over the zone VPN / trusted LAN, and tvh-controller
+# is the only client expected to reach it — the daemon itself provides NO
+# defense in depth (same trust model as `rclone rcd --rc-no-auth`, see
+# tvh_controller's deploy/host/rclone-rcd.service). Do not bind listen.host
+# to a publicly routable interface, and do not expose port 5580 through any
+# firewall/NAT. Only the nginx-served serveDir (HLS output) is meant to be
+# viewer-reachable.
+[Unit]
+Description=restreamer HLS daemon (tvh-controller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the user that owns serveDir; edit for the host (e.g. hts).
+User=restreamer
+Group=restreamer
+Environment=RESTREAMER_CONFIG=/etc/restreamer/config.yaml
+ExecStart=/usr/bin/node /opt/restreamer/dist/main.js
+Restart=on-failure
+RestartSec=10
+# mixed: systemd's SIGTERM goes to the daemon only — it owns the graceful
+# teardown of its ffmpeg/tsreadex children (abort source -> flush final
+# segments -> SIGTERM -> SIGKILL); anything still alive after TimeoutStopSec
+# gets systemd's SIGKILL to the whole control group.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

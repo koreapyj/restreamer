@@ -1,0 +1,47 @@
+# restreamer HLS daemon (one per tvheadend host) for tvh-controller.
+# Debian-package variant of deploy/restreamer.service: installed by the
+# 'restreamer' deb to /lib/systemd/system/restreamer.service. The app lives
+# under /usr/lib/restreamer with a bundled Node.js runtime; the config is the
+# dpkg conffile /etc/restreamer/config.yaml.
+#
+# serveDir (default /media) must exist and be writable by the 'restreamer'
+# user. Either grant that user write access, or run as the user that already
+# owns serveDir via `systemctl edit restreamer`:
+#   [Service]
+#   User=hts
+#   Group=hts
+#
+# SECURITY: the daemon's HTTP API is UNAUTHENTICATED by contract — any host
+# that can reach listen.host:listen.port can replace the desired state and
+# thereby start/stop arbitrary tvheadend subscriptions and ffmpeg processes
+# and write under serveDir, with no credentials and no authorization checks.
+# This is only safe because listen.host is bound to an interface that is
+# reachable exclusively over the zone VPN / trusted LAN, and tvh-controller
+# is the only client expected to reach it — the daemon itself provides NO
+# defense in depth (same trust model as `rclone rcd --rc-no-auth`, see
+# tvh_controller's deploy/host/rclone-rcd.service). Do not bind listen.host
+# to a publicly routable interface, and do not expose port 5580 through any
+# firewall/NAT. Only the nginx-served serveDir (HLS output) is meant to be
+# viewer-reachable.
+[Unit]
+Description=restreamer HLS daemon (tvh-controller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=restreamer
+Group=restreamer
+Environment=RESTREAMER_CONFIG=/etc/restreamer/config.yaml
+ExecStart=/usr/lib/restreamer/runtime/bin/node /usr/lib/restreamer/dist/main.js
+Restart=on-failure
+RestartSec=10
+# mixed: systemd's SIGTERM goes to the daemon only — it owns the graceful
+# teardown of its ffmpeg/tsreadex children (abort source -> flush final
+# segments -> SIGTERM -> SIGKILL); anything still alive after TimeoutStopSec
+# gets systemd's SIGKILL to the whole control group.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
