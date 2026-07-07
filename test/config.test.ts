@@ -45,6 +45,7 @@ describe('loadConfig', () => {
       memoryLimitMb: 2048,
       stopGraceSec: 10,
       cleanupOnRemove: true,
+      cleanupDelaySec: null,
     });
   });
 
@@ -74,6 +75,12 @@ cleanupOnRemove: false
   it('accepts an explicit sourcesM3u path', () => {
     const path = writeConfig('sourcesM3u: /etc/restreamer/sources.m3u\n');
     expect(loadConfig(path).sourcesM3u).toBe('/etc/restreamer/sources.m3u');
+  });
+
+  it('accepts an explicit cleanupDelaySec (override) and rejects a negative value', () => {
+    expect(loadConfig(writeConfig('cleanupDelaySec: 30\n')).cleanupDelaySec).toBe(30);
+    expect(loadConfig(writeConfig('cleanupDelaySec: 0\n')).cleanupDelaySec).toBe(0);
+    expect(() => loadConfig(writeConfig('cleanupDelaySec: -1\n'))).toThrow(/invalid config/);
   });
 
   it('accepts an explicit sourcesM3u null', () => {

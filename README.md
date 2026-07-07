@@ -36,6 +36,7 @@ production values); see `config.example.yaml` for the commented version.
 | `memoryLimitMb` | `2048` | ffmpeg+tsreadex RSS ceiling ⇒ proactive restart (`oom-guard`); `null` = off |
 | `stopGraceSec` | `10` | graceful stop: abort source → wait → SIGTERM → SIGKILL +5s |
 | `cleanupOnRemove` | `true` | delete `<serveDir>/<name>/` when a session leaves the desired doc |
+| `cleanupDelaySec` | `null` | grace before that deletion (hot→cold swap drain); `null` = derive `segmentSeconds × listSize`, `0` = immediate, `N` = fixed seconds |
 
 ### External sources catalog
 

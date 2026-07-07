@@ -39,8 +39,11 @@ import type { DaemonConfig } from '../config.js';
 import type { DesiredStore } from '../state/desiredStore.js';
 import { stableHash } from '../util/hash.js';
 import type { LogEntry } from '../util/logRing.js';
-import { Session } from './session.js';
-import type { BuildPipeline, BuiltPipeline, FsOps, Logger, SessionFactory, SessionLike } from './types.js';
+import { defaultTimers, Session } from './session.js';
+import type { BuildPipeline, BuiltPipeline, FsOps, Logger, SessionFactory, SessionLike, Timers } from './types.js';
+
+/** ceiling for a *derived* cleanup delay, guarding against a misconfigured huge listSize */
+const CLEANUP_DELAY_MAX_SEC = 3600;
 
 interface SessionEntry {
   desired: DesiredSession;
@@ -49,6 +52,15 @@ interface SessionEntry {
   session: SessionLike | null;
   outDir: string | null;
   invalidError?: string;
+}
+
+/** a removal whose `rm -rf outDir` is scheduled but not yet fired */
+interface PendingDeletion {
+  outDir: string;
+  timer: unknown;
+  deadlineMs: number;
+  /** identity across schedule/cancel/fire — neutralizes an already-fired stale timer */
+  token: number;
 }
 
 export interface SupervisorDeps {
@@ -60,6 +72,8 @@ export interface SupervisorDeps {
   sessionFactory?: SessionFactory;
   /** used only for `rm -rf outDir` on removal */
   fs?: Pick<FsOps, 'rm'>;
+  /** clock + timer seam for the deferred-deletion timer; default real timers */
+  timers?: Timers;
   daemonVersion?: string;
 }
 
@@ -73,6 +87,11 @@ export class Supervisor {
   private readonly logger: Logger;
   private readonly sessionFactory: SessionFactory;
   private readonly fs: Pick<FsOps, 'rm'>;
+  private readonly timers: Timers;
+
+  /** removals awaiting a deferred `rm -rf outDir`, keyed by session name */
+  private readonly pendingDeletions = new Map<string, PendingDeletion>();
+  private deletionSeq = 0;
 
   private reconcileChain: Promise<void> = Promise.resolve();
   private reconcileQueued = false;
@@ -84,6 +103,7 @@ export class Supervisor {
     this.config = deps.config;
     this.logger = deps.logger ?? console;
     this.fs = deps.fs ?? fsp;
+    this.timers = deps.timers ?? defaultTimers;
     this.sessionFactory =
       deps.sessionFactory ??
       ((init) =>
@@ -184,9 +204,36 @@ export class Supervisor {
     return result;
   }
 
-  /** Parallel graceful stop of everything (SIGTERM path). Sessions never throw on stop. */
+  /**
+   * Run `fn` serialized on the reconcile chain. Used by the deferred-deletion
+   * timer, which fires OUTSIDE any reconcile but must be mutually exclusive with
+   * doReconcile/createAndStart so its `rm` can never overlap a new session
+   * (re)creating the same deterministic outDir.
+   */
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.reconcileChain.then(fn);
+    this.reconcileChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  /**
+   * Parallel graceful stop of everything (SIGTERM path). Sessions never throw on
+   * stop. Any deferred deletions are flushed synchronously — the process exits
+   * right after, so draining is moot and leaving them would orphan the dirs.
+   */
   async stopAll(): Promise<void> {
     await Promise.all([...this.sessions.values()].map((entry) => entry.session?.stop()));
+    const pending = [...this.pendingDeletions.values()];
+    this.pendingDeletions.clear();
+    await Promise.all(
+      pending.map((p) => {
+        this.timers.clearTimeout(p.timer);
+        return this.rmOutDir(p.outDir);
+      }),
+    );
   }
 
   async restartSession(name: string): Promise<void> {
@@ -231,18 +278,23 @@ export class Supervisor {
     const desiredByName = new Map<string, DesiredSession>();
     for (const session of this.desired?.sessions ?? []) desiredByName.set(session.name, session);
 
-    // removed → graceful stop, then rm -rf outDir when configured
+    // a name that is desired again cancels any pending deletion of its dir — the
+    // (re)created session legitimately reuses serveDir/<name> (as restart does)
+    for (const name of desiredByName.keys()) this.cancelDeletion(name);
+
+    // removed → graceful stop, then rm -rf outDir (deferred by cleanupDelaySec)
     for (const [name, entry] of [...this.sessions]) {
       if (desiredByName.has(name)) continue;
       this.logger.info(`[supervisor] session ${name} removed — stopping`);
       await entry.session?.stop();
       this.sessions.delete(name);
       if (this.config.cleanupOnRemove && entry.outDir) {
-        await this.fs.rm(entry.outDir, { recursive: true, force: true }).catch((err: unknown) => {
-          this.logger.warn(
-            `[supervisor] cleanup of ${entry.outDir} failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
+        const delayMs = this.resolveCleanupDelayMs(entry.desired);
+        if (delayMs <= 0) {
+          await this.rmOutDir(entry.outDir);
+        } else {
+          this.scheduleDeletion(name, entry.outDir, delayMs);
+        }
       }
     }
 
@@ -260,6 +312,9 @@ export class Supervisor {
   }
 
   private async createAndStart(name: string, desired: DesiredSession, configHash: string): Promise<void> {
+    // universal guard for add-back and config-change replace: the new session
+    // owns serveDir/<name>, so any pending deletion of it must be disarmed first
+    this.cancelDeletion(name);
     let pipeline: BuiltPipeline;
     try {
       pipeline = this.buildPipeline(desired);
@@ -280,5 +335,54 @@ export class Supervisor {
     }
     this.sessions.set(name, { desired, configHash, session, outDir: pipeline.outDir });
     await session.start();
+  }
+
+  // ----- deferred cleanup ---------------------------------------------------
+
+  /** Drain delay for a removed session: explicit override, or derived HLS window. */
+  private resolveCleanupDelayMs(desired: DesiredSession): number {
+    const cfg = this.config.cleanupDelaySec;
+    if (cfg !== null) return cfg * 1000; // explicit override (0 = immediate)
+    const p = desired.pipeline;
+    const hls = p.template === 'arib-hls' ? p.hls : undefined;
+    const seg = hls?.segmentSeconds ?? 5; // mirror aribHls.ts template defaults
+    const list = hls?.listSize ?? 120;
+    return Math.min(seg * list, CLEANUP_DELAY_MAX_SEC) * 1000;
+  }
+
+  private scheduleDeletion(name: string, outDir: string, delayMs: number): void {
+    this.cancelDeletion(name); // never double-arm a name
+    const token = ++this.deletionSeq;
+    const deadlineMs = this.timers.now() + delayMs;
+    const timer = this.timers.setTimeout(() => this.fireDeletion(name, token), delayMs);
+    this.pendingDeletions.set(name, { outDir, timer, deadlineMs, token });
+    this.logger.info(
+      `[supervisor] session ${name} removed — cleanup of ${outDir} deferred ${Math.round(delayMs / 1000)}s`,
+    );
+  }
+
+  private cancelDeletion(name: string): void {
+    const pending = this.pendingDeletions.get(name);
+    if (!pending) return;
+    this.timers.clearTimeout(pending.timer);
+    this.pendingDeletions.delete(name);
+  }
+
+  /** Timer callback — fires OUTSIDE the reconcile chain; re-enters it to rm safely. */
+  private fireDeletion(name: string, token: number): void {
+    void this.runExclusive(async () => {
+      const pending = this.pendingDeletions.get(name);
+      if (!pending || pending.token !== token) return; // cancelled or superseded
+      this.pendingDeletions.delete(name);
+      await this.rmOutDir(pending.outDir);
+    });
+  }
+
+  private async rmOutDir(outDir: string): Promise<void> {
+    await this.fs.rm(outDir, { recursive: true, force: true }).catch((err: unknown) => {
+      this.logger.warn(
+        `[supervisor] cleanup of ${outDir} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
   }
 }

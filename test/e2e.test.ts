@@ -108,6 +108,7 @@ beforeAll(async () => {
     memoryLimitMb: null,
     stopGraceSec: 2,
     cleanupOnRemove: true,
+    cleanupDelaySec: 0, // immediate cleanup — the removal assertion checks the dir is gone synchronously
   };
 
   supervisor = new Supervisor({

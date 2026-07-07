@@ -114,7 +114,7 @@ interface Generation {
   stallTimer?: unknown;
 }
 
-const defaultTimers: Timers = {
+export const defaultTimers: Timers = {
   now: () => Date.now(),
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: (h) => clearTimeout(h as NodeJS.Timeout),

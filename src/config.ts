@@ -67,6 +67,14 @@ export const DaemonConfigSchema = Type.Object({
   stopGraceSec: Type.Number({ default: 10 }),
   /** delete `<serveDir>/<name>/` when a session is removed from the desired doc */
   cleanupOnRemove: Type.Boolean({ default: true }),
+  /**
+   * grace before `<serveDir>/<name>/` deletion on removal, so a hot→cold swap
+   * can keep serving the outgoing session's HLS window while the switcher drains
+   * it. null → derive per-session from `hls.segmentSeconds × hls.listSize`
+   * (capped at CLEANUP_DELAY_MAX_SEC); 0 → delete immediately (legacy);
+   * N > 0 → fixed override in seconds. Ignored when cleanupOnRemove is false.
+   */
+  cleanupDelaySec: Type.Union([Type.Number({ minimum: 0 }), Type.Null()], { default: null }),
 });
 export type DaemonConfig = Static<typeof DaemonConfigSchema>;
 

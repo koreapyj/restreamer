@@ -28,6 +28,7 @@ import type {
   FsOps,
   Logger,
   SessionSettings,
+  Timers,
 } from '../../src/supervise/types.js';
 
 export const silentLogger: Logger = { info() {}, warn() {}, error() {} };
@@ -298,4 +299,40 @@ export function sampleSettings(overrides: Partial<SessionSettings> = {}): Sessio
 /** flush stream/microtask callbacks without advancing fake timers (setImmediate stays real) */
 export function flush(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Injectable manual clock implementing the `Timers` seam. `tick(ms)` advances
+ * the clock, fires every timer now due, then flushes microtasks so any async
+ * callback (e.g. the supervisor's deferred `rm`) settles before it returns.
+ * Only setTimeout/clearTimeout are modeled — the supervisor uses nothing else.
+ */
+export function manualTimers() {
+  let now = 0;
+  let seq = 0;
+  const scheduled = new Map<number, { fn: () => void; at: number }>();
+  const timers: Timers = {
+    now: () => now,
+    setTimeout: (fn, ms) => {
+      const id = ++seq;
+      scheduled.set(id, { fn, at: now + ms });
+      return id;
+    },
+    clearTimeout: (h) => {
+      scheduled.delete(h as number);
+    },
+    setInterval: () => 0,
+    clearInterval: () => {},
+  };
+  async function tick(ms: number): Promise<void> {
+    now += ms;
+    for (const [id, e] of [...scheduled]) {
+      if (e.at <= now) {
+        scheduled.delete(id);
+        e.fn();
+      }
+    }
+    await flush();
+  }
+  return { timers, tick, nowMs: () => now, pending: () => scheduled.size };
 }

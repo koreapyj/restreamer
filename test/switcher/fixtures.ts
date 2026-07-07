@@ -173,3 +173,22 @@ export const pdtsOf = (text: string): number[] =>
 
 export const segmentUrisOf = (text: string): string[] =>
   text.split('\n').filter((l) => l !== '' && !l.startsWith('#'));
+
+/** count of served segment URIs baked with the given upstream id (redirect mode) */
+export const countFor = (text: string, upstreamId: string): number =>
+  segmentUrisOf(text).filter((u) => u.startsWith(`seg/${upstreamId}/`)).length;
+
+/** each segment URI paired with its preceding PROGRAM-DATE-TIME (NaN if none) */
+export const segEntries = (text: string): { pdt: number; uri: string }[] => {
+  const out: { pdt: number; uri: string }[] = [];
+  let pdt = Number.NaN;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      pdt = Date.parse(line.slice('#EXT-X-PROGRAM-DATE-TIME:'.length));
+    } else if (line !== '' && !line.startsWith('#')) {
+      out.push({ pdt, uri: line });
+      pdt = Number.NaN;
+    }
+  }
+  return out;
+};

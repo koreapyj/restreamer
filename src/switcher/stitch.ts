@@ -40,62 +40,46 @@
  *              virtual values with an EXT-X-DISCONTINUITY spliced in at
  *              switch points.
  *
- * ── Virtual MEDIA-SEQUENCE (monotonic across switches AND restarts) ────────
+ * ── Served-window buffer (retain the outgoing tail across a switch) ─────────
  *
- * Per (channel, variant) we keep an anchor { upstreamId, anchorFirstRaw,
- * anchorVirtual }:
+ * Per (channel, variant) we keep a rolling buffer of the segments currently in
+ * the served window (oldest → newest), each with a virtual sequence assigned
+ * once at append time. Every render we MERGE the active upstream's playlist in
+ * rather than re-deriving from it:
  *
- *   timeBase(now) = floor(nowMs / 1000 / segmentSeconds)      (epoch base 0)
+ *   1. Append the genuinely-new active segments — those past this variant's
+ *      append cutoff (PDT end in the common case, raw MEDIA-SEQUENCE without
+ *      PDT). Right after a switch the cutoff is where the OLD upstream left
+ *      off, so the new upstream's parallel backlog is skipped (the splice) and
+ *      only content past the splice point is appended.
+ *   2. Hold the window at its pre-switch length while a prior upstream's tail
+ *      is still draining (never collapse), else track the active window length.
+ *   3. Trim the front to that target, aging out the oldest segments.
  *
- *   firstServedRaw = upstream MEDIA-SEQUENCE + dropCount
- *     (dropCount = leading segments removed by the PDT splice, see below —
- *      the raw index of the first segment we actually serve)
+ * This retains the outgoing upstream's already-served segments AHEAD of the
+ * discontinuity and drains them one-per-new-segment, so the window stays a
+ * constant size and players keep their position — instead of the served
+ * playlist collapsing to the new upstream's post-splice remainder. Retained
+ * segment URIs keep pointing at the outgoing upstream (`seg/<old-id>/…`), which
+ * stay resolvable because the node defers deleting a removed session's HLS
+ * window for ≈ segmentSeconds × listSize (the daemon's cleanupDelaySec) — the
+ * same horizon over which the tail drains here.
  *
- *   - First render ever for a variant (fresh process / new channel):
- *       anchorVirtual = timeBase(now); no discontinuity.
- *   - First render after a switch (anchor.upstreamId ≠ active):
- *       anchorVirtual = max(timeBase(now), lastServedVirtual + 1)
- *       and the splice discontinuity is attached to firstServedRaw.
- *   - Every render:
- *       virtual = anchorVirtual + max(0, firstServedRaw − anchorFirstRaw)
+ *   Virtual MEDIA-SEQUENCE = buf[0].virtualSeq.
+ *   Monotonic by construction: virtual sequences only ever increase (assigned
+ *   once, never reused) and we only append to the back / trim from the front.
+ *   Across the retained→new boundary the sequence is literally contiguous (no
+ *   re-anchor jump). An empty buffer (fresh process / restart) seeds the next
+ *   sequence to timeBase(now) = floor(nowMs / 1000 / segmentSeconds): real-time
+ *   encoders slide ≤ 1 segment per segmentSeconds of wall clock and a restart
+ *   takes longer, so the new base lands at or ahead of anything served before.
  *
- * Why this never decreases:
- *   - Within one upstream, firstServedRaw is non-decreasing: when the window
- *     slides over a spliced-out (dropped) segment, raw +1 / drops −1 (sum
- *     unchanged); when it slides over a served segment, raw +1 (sum +1).
- *     The max(0, …) clamp absorbs a raw-sequence regression (encoder
- *     restart) — virtual holds instead of stepping back.
- *   - Across a switch, max(timeBase, last+1) is ≥ everything served before,
- *     even when the new upstream's raw sequence is LOWER than the old one's
- *     (the anchor is re-based, raw values never leak into the tag).
- *   - Across a switcher restart, the fresh anchor is timeBase(now). Real-time
- *     encoders slide ≤ 1 segment per segmentSeconds of wall clock, so the
- *     previous instance's virtual value tracked timeBase within ~1 segment of
- *     jitter — and a restart takes longer than that, so the new base lands at
- *     or ahead of anything previously served.
- *
- * ── Virtual DISCONTINUITY-SEQUENCE ──────────────────────────────────────────
- *
- *   served = discBase + upstream EXT-X-DISCONTINUITY-SEQUENCE (0 if absent)
- *
- * Upstream discontinuities (encoder restarts, discont_start) pass through
- * both as tags and in the sequence. Our splice tag is attached to the raw
- * index of the first post-switch segment: at re-anchor discBase is chosen so
- * the served value is CONTINUOUS with what clients already saw; when the
- * carrying segment slides out of the window the tag disappears and discBase
- * is bumped by one — exactly the RFC 8216 rule for a discontinuity leaving
- * the playlist.
- *
- * ── PDT-aligned splice ──────────────────────────────────────────────────────
- *
- * doSwitch() records the channel-level splice point: the PROGRAM-DATE-TIME
- * end (pdt + duration) of the last segment served to anyone before the
- * switch. Both encoders stamp true wall clock, so on the next render of each
- * variant, leading new-upstream segments whose pdt + duration ≤ splicePoint
- * are dropped — the viewer continues (nearly) exactly where the old upstream
- * left off, with minimal overlap. No PDT ⇒ no drops (plain live-window
- * switch). All variants share the one channel-level switch decision and
- * splice point; each applies it independently on its next render.
+ *   Virtual DISCONTINUITY-SEQUENCE = count of discontinuities that have aged
+ *   off the front (RFC 8216). A switch flags the first appended new-upstream
+ *   segment with an EXT-X-DISCONTINUITY; upstream-origin discontinuities
+ *   (encoder restarts, discont_start) fold into the same per-segment flag.
+ *   The base is seeded from the upstream's value on the first render and bumped
+ *   as flagged segments slide out.
  *
  * ── Health + autonomous failover ────────────────────────────────────────────
  *
@@ -261,44 +245,21 @@ export type SegmentUrlMode = 'redirect' | 'upstream';
  */
 export const SAFE_SEGMENT_FILE = /^(?!\.\.?$)[\w.\-]+$/;
 
-interface RenderMediaOpts {
-  virtualSeq: number;
-  virtualDiscSeq: number;
-  /** leading segments removed by the PDT splice */
-  drop: number;
-  /** index into the KEPT segments before which the splice EXT-X-DISCONTINUITY goes; -1 = none */
-  discIndex: number;
-  /** absolute upstream base for this variant: `<upstream url>/<variant>` */
-  base: string;
-  mode: SegmentUrlMode;
-  /** id of the upstream this playlist was fetched from, baked into `seg/…` URIs */
-  upstreamId: string;
-}
-
-function renderMediaPlaylist(p: ParsedMedia, o: RenderMediaOpts): string {
-  const abs = (uri: string) => (isAbsoluteUri(uri) ? uri : `${o.base}/${uri}`);
-  // redirect mode: flat relative filenames become `seg/<upstreamId>/<file>`,
-  // relative to the media playlist's own URL. Anything the redirect route
-  // could not serve (absolute URIs, paths with directories) falls back to
-  // the absolute upstream form.
-  const rewrite =
-    o.mode === 'redirect'
-      ? (uri: string) =>
-          !isAbsoluteUri(uri) && SAFE_SEGMENT_FILE.test(uri) ? `seg/${o.upstreamId}/${uri}` : abs(uri)
-      : abs;
-  const out: string[] = ['#EXTM3U'];
-  for (const h of p.headerLines) {
-    out.push(h.startsWith('#EXT-X-MAP') ? rewriteUriAttr(h, rewrite) : h);
-  }
-  out.push(`#EXT-X-MEDIA-SEQUENCE:${o.virtualSeq}`);
-  out.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${o.virtualDiscSeq}`);
-  p.segments.slice(o.drop).forEach((seg, i) => {
-    if (i === o.discIndex) out.push('#EXT-X-DISCONTINUITY');
-    out.push(...seg.tags);
-    out.push(rewrite(seg.uri));
-  });
-  if (p.endList) out.push('#EXT-X-ENDLIST');
-  return `${out.join('\n')}\n`;
+/**
+ * Builds the segment / EXT-X-MAP URI rewriter for one upstream + variant.
+ * redirect mode: flat relative filenames become `seg/<upstreamId>/<file>`
+ * (resolved by the switcher's 302 route); anything the route could not serve
+ * (absolute URIs, paths with directories) falls back to the absolute upstream
+ * form. upstream mode: everything absolutized against the upstream base. The
+ * upstream id is baked in per-URI so a segment stays resolvable after a switch
+ * moves the active upstream away (the retained-window drain relies on this).
+ */
+function segmentRewriter(base: string, mode: SegmentUrlMode, upstreamId: string): (uri: string) => string {
+  const abs = (uri: string) => (isAbsoluteUri(uri) ? uri : `${base}/${uri}`);
+  return mode === 'redirect'
+    ? (uri: string) =>
+        !isAbsoluteUri(uri) && SAFE_SEGMENT_FILE.test(uri) ? `seg/${upstreamId}/${uri}` : abs(uri)
+    : abs;
 }
 
 /**
@@ -343,19 +304,42 @@ interface UpstreamHealth {
   lastError?: string;
 }
 
-interface VariantState {
-  /** upstream the anchor belongs to; a mismatch with the active id ⇒ first render after a switch */
+/** one segment in the switcher's served window (already URI-rewritten) */
+interface BufSeg {
+  /** verbatim segment tags MINUS any #EXT-X-DISCONTINUITY (folded into `disc`) */
+  tags: string[];
+  /** rewritten URI, emitted verbatim — carries the SOURCE upstream id */
+  uri: string;
+  /** assigned once, at append time; the served MEDIA-SEQUENCE is buf[0].virtualSeq */
+  virtualSeq: number;
+  /** an EXT-X-DISCONTINUITY precedes this segment (splice boundary OR upstream-origin) */
+  disc: boolean;
+  /** pdt + duration, for append dedup / splice cutoff; null without PDT */
+  pdtEndMs: number | null;
+  /** source media-sequence index, for the no-PDT append fallback */
+  rawSeq: number;
+  /** provenance — a mismatch with the active id means we're draining this segment */
   upstreamId: string;
-  anchorFirstRaw: number;
-  anchorVirtual: number;
-  /** virtual DISCONTINUITY-SEQUENCE = discBase + upstream raw value */
-  discBase: number;
-  /** raw index (new-upstream numbering) of the segment carrying the splice discontinuity; null = none pending */
-  discTagRaw: number | null;
-  /** PDT splice point consumed by this anchor (drop rule), copied from the channel at re-anchor */
-  spliceFromPdtMs: number | null;
-  lastVirtual: number;
-  lastDiscSeq: number;
+}
+
+/**
+ * Per-variant served window. The switcher maintains its own rolling buffer
+ * (oldest → newest) instead of re-deriving from the active upstream each
+ * render, so a switch retains the outgoing tail ahead of the discontinuity and
+ * drains it gradually — the window never collapses. See the module header.
+ */
+interface VariantState {
+  buf: BufSeg[];
+  /** id of the newest appended segment; a mismatch with the active id ⇒ a switch boundary */
+  lastUpstreamId: string | null;
+  /** virtualSeq for the next appended segment (monotonic, never reused) */
+  nextVirtual: number;
+  /** served DISCONTINUITY-SEQUENCE base = count of discontinuities aged off the front */
+  discSeq: number;
+  /** append cutoff (PDT mode); == the splice point right after a switch */
+  lastPdtEndMs: number | null;
+  /** append cutoff (no-PDT fallback) */
+  lastRawSeq: number | null;
 }
 
 interface ChannelState {
@@ -615,8 +599,12 @@ export class Stitcher {
   }
 
   /**
-   * Applies the per-variant virtual sequencing + splice documented at the top
-   * of this file to a freshly parsed upstream playlist.
+   * Merges the freshly parsed upstream playlist into the variant's served
+   * window (see the module header). New active segments are appended with a
+   * monotonic virtual sequence; a switch attaches an EXT-X-DISCONTINUITY to the
+   * first post-boundary segment and RETAINS the outgoing tail so the window
+   * drains gradually instead of collapsing. The window is held at its
+   * pre-switch length while draining, then tracks the active upstream.
    */
   private renderForVariant(
     ch: ChannelState,
@@ -626,72 +614,85 @@ export class Stitcher {
   ): string {
     const nowMs = this.now();
     let vs = ch.variants.get(variant);
-    const reanchor = !vs || vs.upstreamId !== upstream.id;
-    const spliceAt = reanchor ? ch.spliceFromPdtMs : (vs?.spliceFromPdtMs ?? null);
-
-    // PDT splice: drop leading segments that end at or before the splice
-    // point — but never the whole window (always keep the newest segment).
-    let drop = 0;
-    if (spliceAt !== null) {
-      for (const seg of parsed.segments) {
-        if (seg.pdtMs !== null && seg.pdtMs + seg.durationSec * 1000 <= spliceAt) drop += 1;
-        else break;
-      }
-      if (parsed.segments.length > 0 && drop >= parsed.segments.length) drop = parsed.segments.length - 1;
-    }
-
-    const firstRaw = parsed.mediaSequence + drop;
-    const timeBase = Math.floor(nowMs / 1000 / ch.channel.segmentSeconds);
-
-    if (reanchor) {
-      const firstEver = vs === undefined;
-      const anchorVirtual = firstEver ? timeBase : Math.max(timeBase, (vs as VariantState).lastVirtual + 1);
+    if (!vs) {
       vs = {
-        upstreamId: upstream.id,
-        anchorFirstRaw: firstRaw,
-        anchorVirtual,
-        // keep the served DISCONTINUITY-SEQUENCE continuous across the switch
-        discBase: firstEver ? 0 : (vs as VariantState).lastDiscSeq - parsed.discontinuitySequence,
-        // the splice discontinuity rides on the first post-switch segment
-        discTagRaw: firstEver ? null : firstRaw,
-        spliceFromPdtMs: spliceAt,
-        lastVirtual: anchorVirtual,
-        lastDiscSeq: firstEver ? parsed.discontinuitySequence : (vs as VariantState).lastDiscSeq,
+        buf: [],
+        lastUpstreamId: null,
+        // seed to the same time-derived base the old anchor used, so first-render
+        // output and cross-restart monotonicity are preserved
+        nextVirtual: Math.floor(nowMs / 1000 / ch.channel.segmentSeconds),
+        discSeq: parsed.discontinuitySequence,
+        lastPdtEndMs: null,
+        lastRawSeq: null,
       };
       ch.variants.set(variant, vs);
     }
-    const state = vs as VariantState;
+    const state = vs;
 
-    // our splice tag slid out of the upstream window → RFC 8216: sequence +1
-    if (state.discTagRaw !== null && state.discTagRaw < firstRaw) {
-      state.discTagRaw = null;
-      state.discBase += 1;
+    const rewrite = segmentRewriter(`${trimSlash(upstream.url)}/${variant}`, this.segmentUrls, upstream.id);
+    const prevLen = state.buf.length;
+    const boundary = state.lastUpstreamId !== null && state.lastUpstreamId !== upstream.id;
+    const hasPdt = parsed.segments.some((s) => s.pdtMs !== null);
+
+    // select genuinely-new active segments (past this variant's append cutoff).
+    // PDT mode is the splice rule: after a switch, drop the new upstream's
+    // parallel backlog and resume exactly where we left off.
+    const fresh: { seg: ParsedSegment; rawSeq: number }[] = [];
+    parsed.segments.forEach((seg, i) => {
+      const rawSeq = parsed.mediaSequence + i;
+      const isNew =
+        hasPdt && seg.pdtMs !== null
+          ? state.lastPdtEndMs === null || seg.pdtMs + seg.durationSec * 1000 > state.lastPdtEndMs
+          : state.lastRawSeq === null || boundary || rawSeq > state.lastRawSeq;
+      if (isNew) fresh.push({ seg, rawSeq });
+    });
+
+    fresh.forEach(({ seg, rawSeq }, idx) => {
+      const upstreamDisc = seg.tags.some((t) => t === '#EXT-X-DISCONTINUITY');
+      state.buf.push({
+        tags: upstreamDisc ? seg.tags.filter((t) => t !== '#EXT-X-DISCONTINUITY') : seg.tags,
+        uri: rewrite(seg.uri),
+        virtualSeq: state.nextVirtual++,
+        disc: (boundary && idx === 0) || upstreamDisc,
+        pdtEndMs: seg.pdtMs !== null ? seg.pdtMs + seg.durationSec * 1000 : null,
+        rawSeq,
+        upstreamId: upstream.id,
+      });
+    });
+    if (fresh.length > 0) {
+      const last = fresh[fresh.length - 1]!;
+      state.lastUpstreamId = upstream.id;
+      state.lastRawSeq = last.rawSeq;
+      if (last.seg.pdtMs !== null) state.lastPdtEndMs = last.seg.pdtMs + last.seg.durationSec * 1000;
     }
 
-    const virtualSeq = state.anchorVirtual + Math.max(0, firstRaw - state.anchorFirstRaw);
-    const virtualDiscSeq = state.discBase + parsed.discontinuitySequence;
-    state.lastVirtual = virtualSeq;
-    state.lastDiscSeq = virtualDiscSeq;
-
-    let discIndex = -1;
-    if (state.discTagRaw !== null) {
-      const idx = state.discTagRaw - firstRaw;
-      if (idx >= 0 && idx < parsed.segments.length - drop) discIndex = idx;
+    // hold the window at its pre-switch length while a prior upstream's tail is
+    // still draining (so it can never collapse); otherwise track the active
+    // upstream's own window length.
+    const draining = state.buf.some((b) => b.upstreamId !== upstream.id);
+    const target = draining ? Math.max(1, parsed.segments.length, prevLen) : Math.max(1, parsed.segments.length);
+    while (state.buf.length > target) {
+      const gone = state.buf.shift();
+      if (gone?.disc) state.discSeq += 1; // a discontinuity left the window (RFC 8216)
     }
 
     if (parsed.lastPdtEndMs !== null) {
       ch.lastServedPdtEndMs = Math.max(ch.lastServedPdtEndMs ?? 0, parsed.lastPdtEndMs);
     }
 
-    return renderMediaPlaylist(parsed, {
-      virtualSeq,
-      virtualDiscSeq,
-      drop,
-      discIndex,
-      base: `${trimSlash(upstream.url)}/${variant}`,
-      mode: this.segmentUrls,
-      upstreamId: upstream.id,
-    });
+    const out: string[] = ['#EXTM3U'];
+    for (const h of parsed.headerLines) {
+      out.push(h.startsWith('#EXT-X-MAP') ? rewriteUriAttr(h, rewrite) : h);
+    }
+    out.push(`#EXT-X-MEDIA-SEQUENCE:${state.buf[0]?.virtualSeq ?? state.nextVirtual}`);
+    out.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${state.discSeq}`);
+    for (const seg of state.buf) {
+      if (seg.disc) out.push('#EXT-X-DISCONTINUITY');
+      out.push(...seg.tags);
+      out.push(seg.uri);
+    }
+    if (parsed.endList) out.push('#EXT-X-ENDLIST');
+    return `${out.join('\n')}\n`;
   }
 
   /**

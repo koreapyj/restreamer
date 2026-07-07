@@ -64,3 +64,11 @@ stopGraceSec: 10
 
 # Delete <serveDir>/<name>/ when a session is removed from the desired doc.
 cleanupOnRemove: true
+
+# Grace before that deletion, so a hot->cold swap keeps serving the outgoing
+# session's HLS window while the switcher drains it.
+#   null -> derive per-session from hls.segmentSeconds x hls.listSize (capped 1h)
+#   0    -> delete immediately (legacy)
+#   N    -> fixed override in seconds
+# Ignored when cleanupOnRemove is false.
+cleanupDelaySec: null

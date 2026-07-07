@@ -12,9 +12,9 @@ import type { DaemonConfig } from '../src/config.js';
 import type { DesiredSession, DesiredState, SessionStatus } from '../src/contract/v1.js';
 import { DesiredStore } from '../src/state/desiredStore.js';
 import { Supervisor } from '../src/supervise/supervisor.js';
-import type { BuildPipeline, SessionFactory, SessionFactoryInit } from '../src/supervise/types.js';
+import type { BuildPipeline, SessionFactory, SessionFactoryInit, Timers } from '../src/supervise/types.js';
 import { stableHash } from '../src/util/hash.js';
-import { sampleBuilt, sampleDesired, silentLogger } from './support/fakes.js';
+import { manualTimers, sampleBuilt, sampleDesired, silentLogger } from './support/fakes.js';
 
 function testConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig {
   return {
@@ -32,6 +32,9 @@ function testConfig(overrides: Partial<DaemonConfig> = {}): DaemonConfig {
     memoryLimitMb: 2048,
     stopGraceSec: 10,
     cleanupOnRemove: true,
+    // immediate by default so the existing sync-rm assertions hold; the
+    // delayed-cleanup suite overrides this and injects a manual clock
+    cleanupDelaySec: 0,
     ...overrides,
   };
 }
@@ -98,7 +101,7 @@ describe('Supervisor', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function makeSupervisor(opts: { config?: Partial<DaemonConfig>; factory?: SessionFactory } = {}) {
+  function makeSupervisor(opts: { config?: Partial<DaemonConfig>; factory?: SessionFactory; timers?: Timers } = {}) {
     const factory: SessionFactory =
       opts.factory ??
       ((init) => {
@@ -117,6 +120,7 @@ describe('Supervisor', () => {
           rmCalls.push(p);
         },
       },
+      ...(opts.timers ? { timers: opts.timers } : {}),
     });
   }
 
@@ -288,5 +292,99 @@ describe('Supervisor', () => {
     await sup.restartSession('alpha');
     expect((created[0] as FakeSession).restartCalls).toBe(1);
     await expect(sup.restartSession('ghost')).rejects.toThrow(/unknown session/);
+  });
+
+  describe('delayed cleanup', () => {
+    it('defers rm by the derived HLS window (segmentSeconds × listSize)', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta
+
+      expect((created[1] as FakeSession).stopCalls).toBe(1); // stopped immediately
+      expect(rmCalls).toEqual([]); // but NOT yet deleted
+      expect(byName(sup, 'beta')).toBeUndefined();
+
+      await clock.tick(600_000 - 1); // 5 × 120 = 600s; one ms short
+      expect(rmCalls).toEqual([]);
+      await clock.tick(1);
+      expect(rmCalls).toEqual(['/media/beta']);
+      expect(clock.pending()).toBe(0);
+    });
+
+    it('a non-null cleanupDelaySec overrides the derived delay', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 30 }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
+
+      await clock.tick(29_999);
+      expect(rmCalls).toEqual([]);
+      await clock.tick(1);
+      expect(rmCalls).toEqual(['/media/beta']);
+    });
+
+    it('cleanupDelaySec:0 deletes immediately (no timer)', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 0 }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
+
+      expect(rmCalls).toEqual(['/media/beta']); // synchronous, before any tick
+      expect(clock.pending()).toBe(0);
+    });
+
+    it('re-adding a session before its deletion fires cancels the deletion (name reuse)', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → schedule
+      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add before fire
+
+      expect(clock.pending()).toBe(0); // timer disarmed
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual([]); // dir was never deleted — reused by the new session
+      expect(byName(sup, 'beta')?.state).toBe('running');
+    });
+
+    it('rapid remove→add→remove reschedules and deletes exactly once', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove (token 1)
+      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add (cancel)
+      await sup.applyDesired(doc('rev-4', [sess('alpha')])); // remove again (token 2)
+
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual(['/media/beta']); // exactly one deletion
+    });
+
+    it('stopAll flushes pending deletions synchronously', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → pending
+
+      await sup.stopAll();
+      expect(rmCalls).toEqual(['/media/beta']); // flushed without ticking
+      expect(clock.pending()).toBe(0);
+
+      await clock.tick(600_000); // no double-delete
+      expect(rmCalls).toEqual(['/media/beta']);
+    });
+
+    it('cleanupOnRemove:false schedules nothing even with a delay set', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({
+        config: { cleanupOnRemove: false, cleanupDelaySec: 30 },
+        timers: clock.timers,
+      });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
+
+      expect(clock.pending()).toBe(0);
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual([]);
+    });
   });
 });

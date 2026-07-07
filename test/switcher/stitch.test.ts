@@ -18,13 +18,14 @@ import {
   NODE_A,
   NODE_B,
   T0,
+  countFor,
   desiredDoc,
   discCount,
   discSeqOf,
   liveUpstream,
   makeFetch,
   mediaPlaylist,
-  pdtsOf,
+  segEntries,
   segName,
   segmentUrisOf,
   seqOf,
@@ -117,7 +118,7 @@ describe('media playlist rewriting', () => {
     expect(discSeqOf(text)).toBe(0);
   });
 
-  it('embeds the render-time upstream id: pre-switch playlists keep the old id, post-switch ones carry the new id', async () => {
+  it('retains the outgoing-upstream tail across a switch, then fully drains to the new id', async () => {
     const { stitcher, clock } = setup();
     const before = await stitcher.getMediaPlaylist('ch1', '1080p');
     // a viewer caching this playlist can still resolve every segment via p-a
@@ -126,8 +127,15 @@ describe('media playlist rewriting', () => {
     stitcher.switchTo('ch1', 'p-b', 'manual');
     clock.nowMs = T0 + 7000;
     const after = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(after).length).toBeGreaterThan(0);
-    expect(segmentUrisOf(after).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    // the window did NOT collapse: the p-a tail is retained ahead of the new p-b head
+    expect(countFor(after, 'p-a')).toBeGreaterThan(0);
+    expect(segmentUrisOf(after).at(-1)).toContain('seg/p-b/');
+
+    // after ~one window of new segments the retained tail has drained out
+    clock.nowMs = T0 + 45_000;
+    const drained = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(segmentUrisOf(drained).length).toBeGreaterThan(0);
+    expect(segmentUrisOf(drained).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
   });
 });
 
@@ -147,11 +155,11 @@ describe('virtual MEDIA-SEQUENCE', () => {
     const v1 = seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'));
     stitcher.switchTo('ch1', 'p-b', 'manual');
     clock.nowMs += 6000;
-    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(text).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
-    const v2 = seqOf(text);
+    const v2 = seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'));
     expect(v2).toBeGreaterThan(v1); // never steps back to B's raw numbering
-    expect(v2).toBeGreaterThan(1_000_000);
+    expect(v2).toBeGreaterThan(1_000_000); // stays on the time-derived virtual base
+    clock.nowMs += 5000;
+    expect(seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'))).toBeGreaterThanOrEqual(v2);
   });
 
   it('stays monotonic across a switcher restart (new instance, later wall clock)', async () => {
@@ -222,19 +230,157 @@ describe('discontinuity bookkeeping', () => {
   });
 });
 
+describe('served-window retention', () => {
+  it('never collapses the served window on a hot-hot switch', async () => {
+    const { stitcher, clock } = setup();
+    const before = segmentUrisOf(await stitcher.getMediaPlaylist('ch1', '1080p'));
+    expect(before).toHaveLength(6);
+
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs = T0 + 6000; // one segment later
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const uris = segmentUrisOf(text);
+    expect(uris.length).toBeGreaterThanOrEqual(6); // NOT collapsed to ~1 (the bug)
+    expect(countFor(text, 'p-a')).toBeGreaterThan(0); // outgoing tail retained
+    expect(uris.at(-1)).toContain('seg/p-b/'); // newest is the new upstream
+    expect(discCount(text)).toBe(1);
+  });
+
+  it('drains the retained tail one-per-new-segment at a constant window size', async () => {
+    const { stitcher, clock } = setup();
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+
+    let prevSeq = -Infinity;
+    let prevA = 6;
+    for (let step = 1; step <= 6; step += 1) {
+      clock.nowMs = T0 + 1000 + step * 5000;
+      const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+      expect(segmentUrisOf(text)).toHaveLength(6); // constant window
+      const a = countFor(text, 'p-a');
+      expect(a).toBeLessThan(prevA); // exactly one p-a drained each step
+      expect(countFor(text, 'p-b')).toBe(6 - a);
+      const seq = seqOf(text);
+      expect(seq).toBeGreaterThan(prevSeq); // media-sequence monotonic + contiguous
+      prevA = a;
+      prevSeq = seq;
+    }
+    expect(prevA).toBe(0); // fully drained to p-b
+  });
+
+  it('reverts to plain single-upstream rendering after the tail drains', async () => {
+    const { stitcher, clock } = setup();
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    let text = '';
+    for (let step = 1; step <= 8; step += 1) {
+      clock.nowMs = T0 + 1000 + step * 5000;
+      text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    }
+    expect(segmentUrisOf(text).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    expect(discCount(text)).toBe(0); // the splice discontinuity aged out
+    expect(discSeqOf(text)).toBe(1);
+    const s1 = seqOf(text);
+    clock.nowMs += 5000; // steady single-upstream slide
+    expect(seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'))).toBe(s1 + 1);
+  });
+
+  it('cold→hot promote (new upstream has no backlog) drains without collapsing', async () => {
+    const { stitcher, clock } = setup({ bOpts: { window: 1 } });
+    await stitcher.getMediaPlaylist('ch1', '1080p'); // p-a, full 6-segment window
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs = T0 + 6000;
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    // B offers only 1 segment, but the window is held at the pre-switch length
+    expect(segmentUrisOf(text).length).toBeGreaterThanOrEqual(6);
+    expect(countFor(text, 'p-a')).toBe(5);
+    expect(countFor(text, 'p-b')).toBe(1);
+  });
+
+  it('switches back to the original upstream (A→B→A) monotonically', async () => {
+    const { stitcher, clock } = setup();
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs = T0 + 11_000;
+    const midSeq = seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'));
+    stitcher.switchTo('ch1', 'p-a', 'manual'); // switch back
+    clock.nowMs = T0 + 21_000;
+    const back = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(seqOf(back)).toBeGreaterThan(midSeq); // monotonic across both switches
+    expect(segmentUrisOf(back).at(-1)).toContain('seg/p-a/'); // newest is p-a again
+    expect(discCount(back)).toBeGreaterThanOrEqual(1); // a fresh discontinuity on re-entry
+  });
+
+  it('keeps the window across a chained switch A→B→C', async () => {
+    const NODE_C = 'http://node-c/media/ch1';
+    const { stitcher, clock, net } = setup();
+    liveUpstream(net, NODE_C, clock);
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.upstreams = [
+      { id: 'p-a', url: NODE_A, priority: 1 },
+      { id: 'p-b', url: NODE_B, priority: 2 },
+      { id: 'p-c', url: NODE_C, priority: 3 },
+    ];
+    stitcher.applyDesired(doc);
+
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs = T0 + 8000;
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-c', 'manual');
+    clock.nowMs = T0 + 13_000;
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(segmentUrisOf(text).length).toBeGreaterThanOrEqual(6); // never collapsed
+    expect(discCount(text)).toBeGreaterThanOrEqual(1);
+    expect(discCount(text)).toBeLessThanOrEqual(2); // at most two in-window boundaries
+    expect(segmentUrisOf(text).at(-1)).toContain('seg/p-c/');
+  });
+
+  it('rebuilds from the active upstream after a restart mid-drain', async () => {
+    const { stitcher, clock, net } = setup();
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs = T0 + 7000;
+    await stitcher.getMediaPlaylist('ch1', '1080p'); // mid-drain: 5 p-a + 1 p-b
+    const selections = stitcher.getSelections();
+
+    // "restart": fresh instance, in-memory buffer lost
+    clock.nowMs = T0 + 12_000;
+    const stitcher2 = new Stitcher({
+      cacheTtlMs: 2000,
+      stallGraceSec: 10,
+      fetchImpl: net.fetchImpl,
+      now: () => clock.nowMs,
+    });
+    stitcher2.applyDesired(desiredDoc(), selections);
+    const text = await stitcher2.getMediaPlaylist('ch1', '1080p');
+    // clean re-window from the active upstream — monotonic, no spurious boundary
+    expect(segmentUrisOf(text).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    expect(seqOf(text)).toBe(timeBase(clock.nowMs));
+    expect(discCount(text)).toBe(0);
+  });
+});
+
 describe('PDT-aligned splice', () => {
-  it('drops leading new-upstream segments that end at or before the splice point', async () => {
+  it('resumes the new upstream exactly at the splice point, behind the retained old tail', async () => {
     const { stitcher, clock } = setup();
     await stitcher.getMediaPlaylist('ch1', '1080p'); // last served segment ends at T0
     stitcher.switchTo('ch1', 'p-b', 'manual');
 
-    clock.nowMs = T0 + 7000; // B's live window still overlaps [T0-30s, T0+5s]
+    clock.nowMs = T0 + 7000; // B's live window still overlaps [T0-25s, T0+5s]
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    const pdts = pdtsOf(text);
-    expect(pdts.length).toBeGreaterThan(0);
-    // nothing already covered by the old upstream is served again
-    for (const pdt of pdts) expect(pdt + 5000).toBeGreaterThan(T0);
-    expect(Math.min(...pdts)).toBe(T0); // resumes exactly at the splice point
+    // the new upstream's own segments are only those PAST the splice point —
+    // nothing already covered by the old upstream is replayed under the new id
+    const bEntries = segEntries(text).filter((e) => e.uri.startsWith('seg/p-b/'));
+    expect(bEntries.length).toBeGreaterThan(0);
+    for (const e of bEntries) expect(e.pdt + 5000).toBeGreaterThan(T0);
+    expect(Math.min(...bEntries.map((e) => e.pdt))).toBe(T0); // resumes exactly at the splice point
+
+    // the retained p-a tail sits AHEAD of the p-b head (continuous window)
+    const uris = segmentUrisOf(text);
+    const firstB = uris.findIndex((u) => u.startsWith('seg/p-b/'));
+    expect(firstB).toBeGreaterThan(0);
+    expect(uris.slice(0, firstB).every((u) => u.startsWith('seg/p-a/'))).toBe(true);
   });
 });
 
