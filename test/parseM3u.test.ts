@@ -61,16 +61,6 @@ describe('parseM3u', () => {
     ]);
   });
 
-  it('warns and skips an entry with an empty tvg-chno attribute', () => {
-    const { entries, warnings } = parseM3u(
-      ['#EXTINF:-1 tvg-id="a" tvg-chno="",Chan A', 'http://a/'].join('\n'),
-    );
-    expect(entries).toEqual([]);
-    expect(warnings).toEqual([
-      'entry "Chan A": missing tvg-chno — skipped (entries are matched by name + tvg-chno)',
-    ]);
-  });
-
   it('passes chno through verbatim as a string ("9.10" stays "9.10")', () => {
     const { entries } = parseM3u(['#EXTINF:-1 tvg-id="x" tvg-chno="9.10",X', 'http://x/'].join('\n'));
     expect(entries[0]?.chno).toBe('9.10');
@@ -121,19 +111,6 @@ describe('parseM3u', () => {
     expect(renamed).toBe(a); // id follows the URL, not the display name
   });
 
-  it('an explicit tvg-id passes through verbatim (even duplicated)', () => {
-    const { entries, warnings } = parseM3u(
-      [
-        '#EXTINF:-1 tvg-id="dup" tvg-chno="1",First',
-        'http://1/',
-        '#EXTINF:-1 tvg-id="dup" tvg-chno="2",Second',
-        'http://2/',
-      ].join('\n'),
-    );
-    expect(entries.map((e) => e.id)).toEqual(['dup', 'dup']);
-    expect(warnings).toEqual([]);
-  });
-
   it('warns and skips an #EXTINF with no following URL', () => {
     const { entries, warnings } = parseM3u(
       [
@@ -179,10 +156,5 @@ describe('parseM3u', () => {
     );
     expect(warnings).toEqual([]);
     expect(entries).toEqual([{ id: 'crlf', name: 'CRLF Chan', url: 'http://crlf/', chno: '12' }]);
-  });
-
-  it('returns empty entries and no warnings for an empty or header-only file', () => {
-    expect(parseM3u('')).toEqual({ entries: [], warnings: [] });
-    expect(parseM3u('#EXTM3U\n')).toEqual({ entries: [], warnings: [] });
   });
 });

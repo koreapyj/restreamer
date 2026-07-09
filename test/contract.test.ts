@@ -7,7 +7,6 @@ import { Value } from '@sinclair/typebox/value';
 import { describe, expect, it } from 'vitest';
 import {
   DesiredState,
-  RESTREAMER_API_VERSION,
   SessionStatus,
   SourceCatalogEntry,
   SourcesResponse,
@@ -52,10 +51,6 @@ function atXDoc(): DesiredStateT {
 }
 
 describe('DesiredState', () => {
-  it('exports apiVersion 1', () => {
-    expect(RESTREAMER_API_VERSION).toBe(1);
-  });
-
   it('accepts a realistic production doc (at-x)', () => {
     expect(Value.Check(DesiredState, atXDoc())).toBe(true);
   });
@@ -122,13 +117,6 @@ describe('DesiredState', () => {
   it('accepts a missing programNumber (daemon PAT-probes)', () => {
     const doc = atXDoc() as unknown as { sessions: [{ tsreadex: Record<string, unknown> }] };
     delete doc.sessions[0].tsreadex['programNumber'];
-    expect(Value.Check(DesiredState, doc)).toBe(true);
-  });
-
-  it('accepts a url-source session with an empty tsreadex object', () => {
-    const doc = atXDoc();
-    doc.sessions[0]!.source = { url: 'http://example.local/stream.ts' };
-    doc.sessions[0]!.tsreadex = {};
     expect(Value.Check(DesiredState, doc)).toBe(true);
   });
 

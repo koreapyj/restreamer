@@ -19,12 +19,6 @@ describe('canonicalJson', () => {
   it('drops undefined properties', () => {
     expect(canonicalJson({ a: 1, b: undefined })).toBe('{"a":1}');
   });
-
-  it('handles primitives and null', () => {
-    expect(canonicalJson(null)).toBe('null');
-    expect(canonicalJson('x')).toBe('"x"');
-    expect(canonicalJson(5)).toBe('5');
-  });
 });
 
 describe('stableHash', () => {

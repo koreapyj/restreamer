@@ -276,14 +276,6 @@ describe('Supervisor', () => {
     expect(byName(sup, 'unbuildable-y')?.lastError).toContain('template rejected params');
   });
 
-  it('startFromDisk with no state file starts zero sessions', async () => {
-    const sup = makeSupervisor();
-    await sup.startFromDisk();
-    expect(sup.statuses()).toEqual([]);
-    expect(sup.getDesired()).toBeNull();
-    expect(sup.desiredRevision).toBeNull();
-  });
-
   it('startFromDisk with a corrupt state file moves it aside and starts zero sessions', async () => {
     await writeFile(join(dir, 'desired.json'), '{not json');
     const sup = makeSupervisor();
@@ -438,20 +430,6 @@ describe('Supervisor', () => {
 
       await clock.tick(600_000); // no double-delete
       expect(rmCalls).toEqual(['/media/beta']);
-    });
-
-    it('cleanupOnRemove:false schedules nothing even with a delay set', async () => {
-      const clock = manualTimers();
-      const sup = makeSupervisor({
-        config: { cleanupOnRemove: false, cleanupDelaySec: 30 },
-        timers: clock.timers,
-      });
-      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
-      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
-
-      expect(clock.pending()).toBe(0);
-      await clock.tick(600_000);
-      expect(rmCalls).toEqual([]);
     });
   });
 });

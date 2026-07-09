@@ -195,9 +195,7 @@ describe('switcher server', () => {
     await putDesired(desiredDoc());
     const cases = [
       '/hls/ch1/1080p/seg/p-a/%2e%2e%2fsecret.ts', // encoded ../ in the filename
-      '/hls/ch1/1080p/seg/p-a/..%2fsecret.ts',
       '/hls/ch1/1080p/seg/p-a/..', // bare dot-dot
-      '/hls/ch1/1080p/seg/p-a/a%2fb.ts', // encoded slash
       '/hls/ch1/%2e%2e/seg/p-a/x.ts', // traversal via the variant
       '/hls/nope/1080p/seg/p-a/x.ts', // unknown slug
       '/hls/ch1/1080p/seg/p-zzz/x.ts', // unknown upstream

@@ -16,13 +16,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { configDefaults, defineConfig } from 'vitest/config';
+import { defineConfig } from 'vitest/config';
 
-// test/e2e.test.ts spawns real child processes and takes ~5s on its own —
-// excluded from the default run; run it via `pnpm test:e2e` (vitest.e2e.config.ts).
+// Config for the end-to-end suite (test/e2e.test.ts): real Supervisor + real
+// Fastify server + real child processes on fixture scripts. Excluded from the
+// default `pnpm test` (see vitest.config.ts) because it costs more wall-clock
+// than the rest of the suite combined.
 export default defineConfig({
   test: {
-    include: ['test/**/*.test.ts'],
-    exclude: [...configDefaults.exclude, 'test/e2e.test.ts'],
+    include: ['test/e2e.test.ts'],
   },
 });
