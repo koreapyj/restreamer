@@ -520,3 +520,106 @@ describe('health file', () => {
     expect(fs.has('/media/at-x/health')).toBe(false);
   });
 });
+
+describe('log subscription (SSE backing)', () => {
+  it('snapshots the tail atomically and delivers only subsequent lines live — no duplicates, no gaps', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    spawn.ffmpeg().writeStderr('line 1');
+    spawn.tsreadex().writeStderr('line 2');
+    await flush();
+
+    const live: string[] = [];
+    let ended = 0;
+    const sub = session.subscribeLog(10, {
+      onLine: (e) => live.push(`${e.src}:${e.line}`),
+      onEnd: () => {
+        ended += 1;
+      },
+    });
+    expect(sub.live).toBe(true);
+    expect(sub.tail.map((e) => e.line)).toEqual(['line 1', 'line 2']);
+
+    spawn.ffmpeg().writeStderr('line 3');
+    await flush();
+    expect(live).toEqual(['ffmpeg:line 3']); // replayed lines never re-delivered
+    expect(ended).toBe(0);
+  });
+
+  it('keeps delivering across a watchdog/crash restart within the same Session object', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    const live: string[] = [];
+    session.subscribeLog(0, { onLine: (e) => live.push(e.line), onEnd: () => undefined });
+
+    spawn.ffmpeg().writeStderr('old generation');
+    await flush();
+    spawn.ffmpeg().exit(1); // crash → backoff → auto-restart
+    await vi.advanceTimersByTimeAsync(2_001);
+    await flush();
+    expect(session.state).toBe('running');
+
+    spawn.ffmpeg().writeStderr('new generation');
+    await flush();
+    expect(live).toEqual(['old generation', 'new generation']);
+  });
+
+  it('endLogStreams() fires onEnd on every subscriber, is idempotent, and detaches them', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    const live: string[] = [];
+    let endedA = 0;
+    let endedB = 0;
+    session.subscribeLog(0, { onLine: (e) => live.push(e.line), onEnd: () => void (endedA += 1) });
+    session.subscribeLog(0, { onLine: (e) => live.push(e.line), onEnd: () => void (endedB += 1) });
+
+    session.endLogStreams();
+    session.endLogStreams(); // idempotent
+    expect(endedA).toBe(1);
+    expect(endedB).toBe(1);
+
+    spawn.ffmpeg().writeStderr('after end');
+    await flush();
+    expect(live).toEqual([]); // cleared subscribers receive nothing
+  });
+
+  it('unsubscribe() detaches just that subscriber', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    const a: string[] = [];
+    const b: string[] = [];
+    const subA = session.subscribeLog(0, { onLine: (e) => a.push(e.line), onEnd: () => undefined });
+    session.subscribeLog(0, { onLine: (e) => b.push(e.line), onEnd: () => undefined });
+    subA.unsubscribe();
+
+    spawn.ffmpeg().writeStderr('only b');
+    await flush();
+    expect(a).toEqual([]);
+    expect(b).toEqual(['only b']);
+  });
+});
+
+describe('resetRestarts', () => {
+  it('zeroes restarts without touching consecutiveFailures, the generation, or backoff state', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    spawn.ffmpeg().exit(1);
+    await vi.advanceTimersByTimeAsync(2_001);
+    await flush();
+    spawn.ffmpeg().exit(1);
+    await vi.advanceTimersByTimeAsync(5_001);
+    await flush();
+    expect(session.state).toBe('running');
+    expect(session.status().restarts).toBe(2);
+    expect(session.status().consecutiveFailures).toBe(2);
+    const pidsBefore = [session.status().ffmpegPid, session.status().tsreadexPid];
+
+    session.resetRestarts();
+
+    const st = session.status();
+    expect(st.restarts).toBe(0);
+    expect(st.consecutiveFailures).toBe(2); // untouched
+    expect(session.state).toBe('running'); // generation untouched
+    expect([st.ffmpegPid, st.tsreadexPid]).toEqual(pidsBefore);
+  });
+});

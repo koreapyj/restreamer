@@ -43,6 +43,10 @@ class FakeSession {
   startCalls = 0;
   stopCalls = 0;
   restartCalls = 0;
+  endLogStreamsCalls = 0;
+  resetRestartsCalls = 0;
+  /** stopCalls value at the moment of the first endLogStreams() — streams must end before the drain */
+  stopCallsAtFirstEnd: number | null = null;
   private state: 'starting' | 'running' | 'disabled' = 'starting';
 
   constructor(readonly init: SessionFactoryInit) {}
@@ -59,6 +63,15 @@ class FakeSession {
 
   async restart(): Promise<void> {
     this.restartCalls++;
+  }
+
+  endLogStreams(): void {
+    if (this.endLogStreamsCalls === 0) this.stopCallsAtFirstEnd = this.stopCalls;
+    this.endLogStreamsCalls++;
+  }
+
+  resetRestarts(): void {
+    this.resetRestartsCalls++;
   }
 
   status(): SessionStatus {
@@ -292,6 +305,60 @@ describe('Supervisor', () => {
     await sup.restartSession('alpha');
     expect((created[0] as FakeSession).restartCalls).toBe(1);
     await expect(sup.restartSession('ghost')).rejects.toThrow(/unknown session/);
+  });
+
+  it('ends log streams before stopping a removed session', async () => {
+    const sup = makeSupervisor();
+    await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+    await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta
+    const beta = created[1] as FakeSession;
+    expect(beta.endLogStreamsCalls).toBe(1);
+    expect(beta.stopCallsAtFirstEnd).toBe(0); // streams ended BEFORE the graceful drain
+    expect((created[0] as FakeSession).endLogStreamsCalls).toBe(0); // survivor untouched
+  });
+
+  it('ends log streams on the discarded session when a config change replaces it', async () => {
+    const sup = makeSupervisor();
+    await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+    await sup.applyDesired(doc('rev-2', [sess('alpha', { enabled: false })])); // hash change → replace
+    const old = created[0] as FakeSession;
+    expect(old.endLogStreamsCalls).toBe(1);
+    expect(old.stopCallsAtFirstEnd).toBe(0);
+    expect((created[1] as FakeSession).endLogStreamsCalls).toBe(0);
+  });
+
+  it('endAllLogStreams ends streams on every live session', async () => {
+    const sup = makeSupervisor();
+    await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+    sup.endAllLogStreams();
+    expect(created.every((s) => s.endLogStreamsCalls === 1)).toBe(true);
+  });
+
+  it('resetSessionRestarts delegates to the session; unknown or invalid names return false', async () => {
+    const sup = makeSupervisor();
+    await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+    expect(sup.resetSessionRestarts('alpha')).toBe(true);
+    expect((created[0] as FakeSession).resetRestartsCalls).toBe(1);
+    expect(sup.resetSessionRestarts('ghost')).toBe(false);
+  });
+
+  it('subscribeSessionLog: null for unknown names, empty non-live subscription for invalid sessions', async () => {
+    const sup = makeSupervisor();
+    await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+    // startFromDisk with a doc containing a session that no longer builds → invalid entry
+    const sup2 = makeSupervisor();
+    const store = new DesiredStore(join(dir, 'desired.json'), silentLogger);
+    await store.save(doc('rev-2', [sess('unbuildable-x')]));
+    await sup2.startFromDisk();
+    expect(byName(sup2, 'unbuildable-x')?.state).toBe('invalid');
+
+    const noop = { onLine: () => undefined, onEnd: () => undefined };
+    expect(sup.subscribeSessionLog('ghost', 10, noop)).toBeNull();
+    const invalidSub = sup2.subscribeSessionLog('unbuildable-x', 10, noop);
+    expect(invalidSub).not.toBeNull();
+    expect(invalidSub!.live).toBe(false);
+    expect(invalidSub!.tail).toEqual([]);
+    expect(sup2.resetSessionRestarts('unbuildable-x')).toBe(false); // action on invalid → 404 path
   });
 
   describe('delayed cleanup', () => {

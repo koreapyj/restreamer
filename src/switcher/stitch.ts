@@ -81,19 +81,26 @@
  *   The base is seeded from the upstream's value on the first render and bumped
  *   as flagged segments slide out.
  *
- * ── Health + autonomous failover ────────────────────────────────────────────
+ * ── Health probing (no autonomous failover) ────────────────────────────────
  *
  * An upstream is unhealthy when a playlist fetch fails (non-2xx / network
  * error) or its media playlist's last PDT lags wall clock by more than
  * 3 × segmentSeconds + stallGraceSec. Health is (re)evaluated on every
  * on-demand fetch of the ACTIVE upstream; probeAll() (driven by a timer in
- * main.ts) checks every upstream of every channel so unwatched channels fail
- * over too and failover targets are known-healthy. Never-probed upstreams
- * are treated optimistically healthy so first-failure failover can proceed.
- * When the active upstream goes unhealthy the channel switches to the
- * highest-priority healthy upstream (reason 'failover'); with no healthy
- * candidate it stays put — a stale-but-fetchable playlist is still served,
- * a failed fetch surfaces as UpstreamUnavailableError (HTTP 503 upstairs).
+ * main.ts) checks every upstream of every channel so status stays fresh, and
+ * applyDesired() eagerly probes never-checked upstreams so a just-pushed
+ * upstream gets a health+lag reading quickly.
+ *
+ * The switcher NEVER switches on its own health judgment: the controller is
+ * the sole failover authority and drives every switch through
+ * POST /v1/channels/:slug/switch (switchTo). The only doc-driven exception is
+ * applyDesired()'s 'push' re-pick when the active upstream disappears from a
+ * controller-authored doc — leaving activeUpstreamId dangling would break
+ * segment resolution, so a deterministic pick from the new doc is the only
+ * sound behavior. When the active upstream is unhealthy the channel stays
+ * put — a stale-but-fetchable playlist is still served, a failed fetch
+ * surfaces as UpstreamUnavailableError (HTTP 503 upstairs) until the
+ * controller orders a switch.
  *
  * Pure-ish: fetch and clock are injected; no filesystem access (persistence
  * is the caller's job via onSelectionsChanged / getSelections()).
@@ -496,6 +503,7 @@ export class Stitcher {
     this.desired = doc;
     this.cache.clear();
     this.onSelectionsChanged();
+    this.probeNeverChecked();
   }
 
   // -------------------------------------------------------------------------
@@ -530,28 +538,21 @@ export class Stitcher {
 
   async getMasterPlaylist(slug: string): Promise<string> {
     const ch = this.requireChannel(slug);
-    const tried = new Set<string>();
-    for (;;) {
-      const upstream = this.activeUpstream(ch);
-      const res = await this.cachedFetch(upstream, 'playlist.m3u8');
-      if (res.ok) {
-        // master has no PDT — fetch success alone marks reachable; preserve any known lag
-        this.markHealth(ch, upstream.id, true, ch.health.get(upstream.id)?.playlistLagSec ?? null);
-        const { text, variants } = rewriteMasterPlaylist(res.text, upstream.url);
-        for (const v of variants) ch.knownVariants.add(v);
-        return text;
-      }
-      this.markHealth(ch, upstream.id, false, null, res.error ?? `HTTP ${res.status}`);
-      tried.add(upstream.id);
-      const candidate = this.pickCandidate(ch, tried);
-      if (!candidate) {
-        throw new UpstreamUnavailableError(
-          `channel ${slug}: no healthy upstream (active ${upstream.id}: ${res.error ?? `HTTP ${res.status}`})`,
-          Math.ceil(ch.channel.segmentSeconds),
-        );
-      }
-      this.doSwitch(ch, candidate.id, 'failover');
+    const upstream = this.activeUpstream(ch);
+    const res = await this.cachedFetch(upstream, 'playlist.m3u8');
+    if (res.ok) {
+      // master has no PDT — fetch success alone marks reachable; preserve any known lag
+      this.markHealth(ch, upstream.id, true, ch.health.get(upstream.id)?.playlistLagSec ?? null);
+      const { text, variants } = rewriteMasterPlaylist(res.text, upstream.url);
+      for (const v of variants) ch.knownVariants.add(v);
+      return text;
     }
+    // no autonomous failover: surface the failure and wait for the controller
+    this.markHealth(ch, upstream.id, false, null, res.error ?? `HTTP ${res.status}`);
+    throw new UpstreamUnavailableError(
+      `channel ${slug}: active upstream unavailable (${upstream.id}: ${res.error ?? `HTTP ${res.status}`})`,
+      Math.ceil(ch.channel.segmentSeconds),
+    );
   }
 
   async getMediaPlaylist(slug: string, variant: string): Promise<string> {
@@ -563,39 +564,26 @@ export class Stitcher {
     if (ch.knownVariants.size > 0 && !ch.knownVariants.has(variant)) {
       throw new UnknownVariantError(`unknown variant ${variant} for channel ${slug}`);
     }
-    const tried = new Set<string>();
-    for (;;) {
-      const upstream = this.activeUpstream(ch);
-      const res = await this.cachedFetch(upstream, `${variant}/stream.m3u8`);
-      if (res.ok) {
-        const parsed = parseMediaPlaylist(res.text);
-        const lagSec = parsed.lastPdtEndMs !== null ? Math.max(0, (this.now() - parsed.lastPdtEndMs) / 1000) : null;
-        const stale = lagSec !== null && lagSec > this.staleThresholdSec(ch);
-        if (!stale) {
-          this.markHealth(ch, upstream.id, true, lagSec);
-          return this.renderForVariant(ch, variant, upstream, parsed);
-        }
+    const upstream = this.activeUpstream(ch);
+    const res = await this.cachedFetch(upstream, `${variant}/stream.m3u8`);
+    if (res.ok) {
+      const parsed = parseMediaPlaylist(res.text);
+      const lagSec = parsed.lastPdtEndMs !== null ? Math.max(0, (this.now() - parsed.lastPdtEndMs) / 1000) : null;
+      const stale = lagSec !== null && lagSec > this.staleThresholdSec(ch);
+      if (!stale) {
+        this.markHealth(ch, upstream.id, true, lagSec);
+      } else {
+        // no autonomous failover: keep serving the stale content until the
+        // controller orders a switch — better a lagging picture than none
         this.markHealth(ch, upstream.id, false, lagSec, `stale playlist (lag ${lagSec.toFixed(1)}s)`);
-        tried.add(upstream.id);
-        const candidate = this.pickCandidate(ch, tried);
-        if (!candidate) {
-          // no healthy alternative — stay on the stale upstream and keep serving its content
-          return this.renderForVariant(ch, variant, upstream, parsed);
-        }
-        this.doSwitch(ch, candidate.id, 'failover');
-        continue;
       }
-      this.markHealth(ch, upstream.id, false, null, res.error ?? `HTTP ${res.status}`);
-      tried.add(upstream.id);
-      const candidate = this.pickCandidate(ch, tried);
-      if (!candidate) {
-        throw new UpstreamUnavailableError(
-          `channel ${slug}/${variant}: no healthy upstream (active ${upstream.id}: ${res.error ?? `HTTP ${res.status}`})`,
-          Math.ceil(ch.channel.segmentSeconds),
-        );
-      }
-      this.doSwitch(ch, candidate.id, 'failover');
+      return this.renderForVariant(ch, variant, upstream, parsed);
     }
+    this.markHealth(ch, upstream.id, false, null, res.error ?? `HTTP ${res.status}`);
+    throw new UpstreamUnavailableError(
+      `channel ${slug}/${variant}: active upstream unavailable (${upstream.id}: ${res.error ?? `HTTP ${res.status}`})`,
+      Math.ceil(ch.channel.segmentSeconds),
+    );
   }
 
   /**
@@ -716,17 +704,29 @@ export class Stitcher {
 
   /**
    * Background probe: checks EVERY upstream of EVERY channel (master + first
-   * media playlist) so health stays fresh for unwatched channels, and fails
-   * over any channel whose active upstream is unhealthy while a healthy
-   * candidate exists. Driven by a probeIntervalMs timer in main.ts.
+   * media playlist) so health/lag stay fresh in status for the controller —
+   * which owns all failover decisions. Never switches. Driven by a
+   * probeIntervalMs timer in main.ts.
    */
   async probeAll(): Promise<void> {
     for (const ch of this.channels.values()) {
       await Promise.all(ch.channel.upstreams.map((up) => this.probeUpstream(ch, up)));
-      const active = ch.activeUpstreamId !== null ? ch.health.get(ch.activeUpstreamId) : undefined;
-      if (ch.activeUpstreamId !== null && active && !active.healthy) {
-        const candidate = this.pickCandidate(ch, new Set([ch.activeUpstreamId]));
-        if (candidate) this.doSwitch(ch, candidate.id, 'failover');
+    }
+  }
+
+  /**
+   * Fire-and-forget probe of every upstream that has never been checked (a
+   * brand-new channel, or a new upstream added to an existing one) — lets the
+   * controller observe health/lag shortly after a push instead of waiting up
+   * to probeIntervalMs for the next probeAll() tick. probeUpstream never
+   * throws (failures become markHealth(false, …)); the catch is defensive.
+   */
+  private probeNeverChecked(): void {
+    for (const ch of this.channels.values()) {
+      for (const up of ch.channel.upstreams) {
+        if (ch.health.get(up.id)?.checkedAt === null) {
+          void this.probeUpstream(ch, up).catch(() => undefined);
+        }
       }
     }
   }
@@ -777,17 +777,6 @@ export class Stitcher {
       );
     }
     ch.health.set(upstreamId, entry);
-  }
-
-  /** highest-priority upstream that is not excluded, not active, and not known-unhealthy */
-  private pickCandidate(ch: ChannelState, exclude: Set<string>): SwitcherUpstream | null {
-    const sorted = [...ch.channel.upstreams].sort((a, b) => a.priority - b.priority);
-    for (const up of sorted) {
-      if (up.id === ch.activeUpstreamId || exclude.has(up.id)) continue;
-      if (ch.health.get(up.id)?.healthy === false) continue;
-      return up;
-    }
-    return null;
   }
 
   // -------------------------------------------------------------------------

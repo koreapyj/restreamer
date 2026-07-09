@@ -151,6 +151,30 @@ export interface SessionDeps {
   onStateChange?: (state: string) => void;
 }
 
+/** Live log consumer (SSE stream) attached to one Session. */
+export interface LogSubscriber {
+  /** a new stderr line from the current (or a future) generation of this Session */
+  onLine(entry: LogEntry): void;
+  /**
+   * this Session object is being discarded (config change / removal) — no
+   * more lines will ever come from it; end the stream so the client can
+   * reconnect and pick up any replacement session under the same name
+   */
+  onEnd(): void;
+}
+
+export interface LogSubscription {
+  /**
+   * ring tail at subscribe time, chronological — captured atomically with
+   * listener registration so no line is duplicated or dropped across the
+   * replay/live boundary
+   */
+  tail: LogEntry[];
+  /** false when there is no live Session object (`invalid` state) — tail is [] and nothing more will arrive */
+  live: boolean;
+  unsubscribe: () => void;
+}
+
 /** What the supervisor needs from a session (the real Session or a test fake). */
 export interface SessionLike {
   start(): Promise<void>;
@@ -159,6 +183,12 @@ export interface SessionLike {
   status(): SessionStatus;
   /** newest `lines` stderr ring entries, chronological (GET /v1/sessions/:name/log); optional so test fakes stay minimal */
   logTail?(lines: number): LogEntry[];
+  /** atomic tail snapshot + live-line subscription (GET /v1/sessions/:name/log/stream) */
+  subscribeLog?(tailLines: number, sub: LogSubscriber): LogSubscription;
+  /** fire onEnd() on all subscribers; called right before this object is discarded */
+  endLogStreams?(): void;
+  /** zero the lifetime restarts counter without touching the running generation */
+  resetRestarts?(): void;
 }
 
 export interface SessionFactoryInit {

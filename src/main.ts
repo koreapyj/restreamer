@@ -85,6 +85,9 @@ async function main(): Promise<void> {
     logger.info(`received ${signal} — stopping API, then draining sessions`);
     void (async () => {
       catalog.stop();
+      // end open SSE log streams first — Fastify's close() waits for in-flight
+      // responses and would otherwise hang on them
+      supervisor.endAllLogStreams();
       await server.close().catch((err: unknown) => {
         logger.warn(`server close failed: ${err instanceof Error ? err.message : String(err)}`);
       });

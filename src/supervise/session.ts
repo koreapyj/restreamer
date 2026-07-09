@@ -54,6 +54,8 @@ import type {
   BuiltPipeline,
   ChildHandle,
   FetchImpl,
+  LogSubscriber,
+  LogSubscription,
   SessionDeps,
   SessionSettings,
   SpawnImpl,
@@ -185,6 +187,8 @@ export class Session {
   private detectedProgramNumber: number | undefined;
   /** aborts an in-flight PAT probe (stop() must not wait out the probe timeout) */
   private probeCancel: (() => void) | undefined;
+  /** live log-stream subscribers; survive generation restarts, cleared on endLogStreams() */
+  private readonly logListeners = new Set<LogSubscriber>();
 
   constructor(init: SessionInit) {
     this.desired = init.desired;
@@ -240,6 +244,34 @@ export class Session {
   /** newest `lines` stderr ring entries in chronological order (GET /v1/sessions/:name/log) */
   logTail(lines: number): LogEntry[] {
     return this.logRing.tail(lines);
+  }
+
+  /**
+   * Atomic tail snapshot + live subscription: no await separates the ring
+   * read from listener registration, so a line can never be duplicated or
+   * dropped across the replay/live boundary.
+   */
+  subscribeLog(tailLines: number, sub: LogSubscriber): LogSubscription {
+    const tail = this.logRing.tail(tailLines);
+    this.logListeners.add(sub);
+    return {
+      tail,
+      live: true,
+      unsubscribe: () => {
+        this.logListeners.delete(sub);
+      },
+    };
+  }
+
+  /** End every open log stream — called right before this Session object is discarded. Idempotent. */
+  endLogStreams(): void {
+    for (const sub of this.logListeners) sub.onEnd();
+    this.logListeners.clear();
+  }
+
+  /** Zero the lifetime restarts counter only — generation, backoff, consecutiveFailures untouched. */
+  resetRestarts(): void {
+    this.restarts = 0;
   }
 
   status(): SessionStatus {
@@ -526,7 +558,9 @@ export class Session {
   private hookStderr(gen: Generation, stream: Readable, src: 'ffmpeg' | 'tsreadex'): void {
     this.onLines(stream, (line) => {
       gen.lastStderr = line;
-      this.logRing.push({ ts: this.iso(), src, line });
+      const entry: LogEntry = { ts: this.iso(), src, line };
+      this.logRing.push(entry);
+      for (const sub of this.logListeners) sub.onLine(entry);
       this.deps.logger.info(`[${this.name}] ${src}: ${line}`);
     });
   }

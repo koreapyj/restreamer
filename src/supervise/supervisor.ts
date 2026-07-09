@@ -40,7 +40,17 @@ import type { DesiredStore } from '../state/desiredStore.js';
 import { stableHash } from '../util/hash.js';
 import type { LogEntry } from '../util/logRing.js';
 import { defaultTimers, Session } from './session.js';
-import type { BuildPipeline, BuiltPipeline, FsOps, Logger, SessionFactory, SessionLike, Timers } from './types.js';
+import type {
+  BuildPipeline,
+  BuiltPipeline,
+  FsOps,
+  Logger,
+  LogSubscriber,
+  LogSubscription,
+  SessionFactory,
+  SessionLike,
+  Timers,
+} from './types.js';
 
 /** ceiling for a *derived* cleanup delay, guarding against a misconfigured huge listSize */
 const CLEANUP_DELAY_MAX_SEC = 3600;
@@ -252,6 +262,36 @@ export class Supervisor {
     return entry.session?.logTail?.(lines) ?? [];
   }
 
+  /**
+   * Live log stream for one session. `null` = unknown session (→ 404); an
+   * `invalid` session (no live Session object) yields an empty, already-ended
+   * subscription — mirroring sessionLog's read convention.
+   */
+  subscribeSessionLog(name: string, tailLines: number, sub: LogSubscriber): LogSubscription | null {
+    const entry = this.sessions.get(name);
+    if (!entry) return null;
+    if (!entry.session?.subscribeLog) {
+      return { tail: [], live: false, unsubscribe: () => undefined };
+    }
+    return entry.session.subscribeLog(tailLines, sub);
+  }
+
+  /**
+   * End every open log stream — called on shutdown BEFORE the HTTP server
+   * closes, so `server.close()` never blocks on a long-lived SSE response.
+   */
+  endAllLogStreams(): void {
+    for (const entry of this.sessions.values()) entry.session?.endLogStreams?.();
+  }
+
+  /** Zero one session's restarts counter. false = unknown or no live Session (→ 404). */
+  resetSessionRestarts(name: string): boolean {
+    const entry = this.sessions.get(name);
+    if (!entry?.session?.resetRestarts) return false;
+    entry.session.resetRestarts();
+    return true;
+  }
+
   statuses(): SessionStatus[] {
     const out: SessionStatus[] = [];
     for (const entry of this.sessions.values()) {
@@ -286,6 +326,8 @@ export class Supervisor {
     for (const [name, entry] of [...this.sessions]) {
       if (desiredByName.has(name)) continue;
       this.logger.info(`[supervisor] session ${name} removed — stopping`);
+      // end log streams at the decision to discard, not after the graceful drain
+      entry.session?.endLogStreams?.();
       await entry.session?.stop();
       this.sessions.delete(name);
       if (this.config.cleanupOnRemove && entry.outDir) {
@@ -304,6 +346,7 @@ export class Supervisor {
       if (existing && existing.configHash === configHash) continue; // unchanged → NOT touched
       if (existing) {
         this.logger.info(`[supervisor] session ${name} changed — replacing`);
+        existing.session?.endLogStreams?.();
         await existing.session?.stop();
         this.sessions.delete(name);
       }

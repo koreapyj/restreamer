@@ -333,6 +333,15 @@ export type SourcesResponse = Static<typeof SourcesResponse>;
 
 // ---------------------------------------------------------------------------
 // Log tail (GET /v1/sessions/:name/log?lines=N)
+//
+// GET /v1/sessions/:name/log/stream — Server-Sent Events: `event: log` per
+// LogLine (replays the ring tail on connect, then streams live lines);
+// `event: end` when the session object is discarded (config change /
+// removal) — reconnect to pick up any replacement session under the name.
+//
+// POST /v1/sessions/:name/restarts/reset — zeroes the lifetime `restarts`
+// counter without disturbing the running process group; 404 for unknown or
+// invalid sessions.
 // ---------------------------------------------------------------------------
 
 export const LogLine = Type.Object({

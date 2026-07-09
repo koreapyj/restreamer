@@ -1,8 +1,9 @@
 /*
  * Splice-core tests: URL rewriting, virtual MEDIA-SEQUENCE monotonicity
  * (window slide / low-sequence switch / restart), discontinuity bookkeeping,
- * PDT-aligned splice, health + autonomous failover, applyDesired selection
- * rules and the fetch micro-cache. Injected fetch + fake clock throughout.
+ * PDT-aligned splice, health probing (no autonomous failover — the controller
+ * owns all switches), applyDesired selection rules and the fetch micro-cache.
+ * Injected fetch + fake clock throughout.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -384,28 +385,31 @@ describe('PDT-aligned splice', () => {
   });
 });
 
-describe('health and autonomous failover', () => {
-  it('fails over to the next-priority upstream when the active fetch fails', async () => {
+describe('health probing (no autonomous failover)', () => {
+  it('marks the active upstream unhealthy and throws — never switches — when its fetch fails with a healthy candidate available', async () => {
     const { stitcher, net, changes } = setup();
     net.routes[`${NODE_A}/1080p/stream.m3u8`] = () => ({ status: 500 });
     const before = changes();
-    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(text)[0]).toContain('seg/p-b/');
+    const err = await stitcher.getMediaPlaylist('ch1', '1080p').then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(UpstreamUnavailableError);
     const status = stitcher.channelStatuses()[0]!;
-    expect(status.activeUpstreamId).toBe('p-b');
-    expect(status.lastSwitch).toMatchObject({ from: 'p-a', to: 'p-b', reason: 'failover' });
+    expect(status.activeUpstreamId).toBe('p-a'); // p-b is healthy, but switching is the controller's job
+    expect(status.lastSwitch).toBeNull();
     expect(status.upstreams.find((u) => u.id === 'p-a')?.healthy).toBe(false);
-    expect(changes()).toBeGreaterThan(before); // selection change persisted via hook
+    expect(changes()).toBe(before); // no selection change persisted
   });
 
-  it('fails over when the active playlist PDT is stale (lag > 3×segmentSeconds + grace)', async () => {
+  it('keeps serving a stale playlist and marks it unhealthy without switching (healthy candidate available)', async () => {
     const { stitcher, aOpts } = setup();
     aOpts.staleSec = 60; // lag 60s > 3×5 + 10 = 25s
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(text)[0]).toContain('seg/p-b/');
+    expect(segmentUrisOf(text)[0]).toContain('seg/p-a/'); // still serving the stale active upstream
     const status = stitcher.channelStatuses()[0]!;
-    expect(status.activeUpstreamId).toBe('p-b');
-    expect(status.lastSwitch?.reason).toBe('failover');
+    expect(status.activeUpstreamId).toBe('p-a');
+    expect(status.lastSwitch).toBeNull();
     const a = status.upstreams.find((u) => u.id === 'p-a')!;
     expect(a.healthy).toBe(false);
     expect(a.playlistLagSec).toBeGreaterThan(55);
@@ -437,17 +441,41 @@ describe('health and autonomous failover', () => {
     expect(stitcher.channelStatuses()[0]!.activeUpstreamId).toBe('p-a');
   });
 
-  it('background probe refreshes health for all upstreams and fails over unwatched channels', async () => {
-    const { stitcher, net } = setup();
+  it('probeAll refreshes health/lag for every upstream but never changes the active selection', async () => {
+    const { stitcher, net, clock } = setup();
+    await new Promise((resolve) => setImmediate(resolve)); // settle the eager setup probe
+    clock.nowMs += 3000; // past the micro-cache warmed by the eager setup probe
     net.routes[`${NODE_A}/playlist.m3u8`] = () => new Error('connect ECONNREFUSED');
     await stitcher.probeAll(); // no viewer ever fetched anything
     const status = stitcher.channelStatuses()[0]!;
-    expect(status.activeUpstreamId).toBe('p-b');
-    expect(status.lastSwitch?.reason).toBe('failover');
+    expect(status.activeUpstreamId).toBe('p-a'); // unhealthy, but never self-switches
+    expect(status.lastSwitch).toBeNull();
     expect(status.upstreams.find((u) => u.id === 'p-a')?.healthy).toBe(false);
     const b = status.upstreams.find((u) => u.id === 'p-b')!;
     expect(b.healthy).toBe(true);
     expect(b.playlistLagSec).toBeDefined(); // probe measured the media playlist
+  });
+});
+
+describe('eager probe on push', () => {
+  it('probes never-checked upstreams right after applyDesired without re-probing known ones', async () => {
+    const { stitcher, net, clock } = setup();
+    await stitcher.probeAll(); // p-a / p-b now known
+    const NODE_C = 'http://node-c/media/ch1';
+    liveUpstream(net, NODE_C, clock, {});
+    const aMasterCalls = () => net.calls.filter((u) => u === `${NODE_A}/playlist.m3u8`).length;
+    const before = aMasterCalls();
+    clock.nowMs += 3000; // past the micro-cache
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.upstreams.push({ id: 'p-c', url: NODE_C, priority: 3 });
+    stitcher.applyDesired(doc);
+    await new Promise((resolve) => setImmediate(resolve)); // flush the fire-and-forget probe
+    const status = stitcher.channelStatuses()[0]!;
+    const c = status.upstreams.find((u) => u.id === 'p-c')!;
+    expect(c.healthy).toBe(true);
+    expect(c.playlistLagSec).toBeDefined(); // really probed, not the optimistic default
+    expect(aMasterCalls()).toBe(before); // already-checked sibling not re-hit
+    expect(status.activeUpstreamId).toBe('p-a'); // eager probe never switches either
   });
 });
 
@@ -504,6 +532,16 @@ describe('manual switch', () => {
     expect(() => stitcher.switchTo('ch1', 'p-zzz', 'manual')).toThrow(UnknownUpstreamError);
     stitcher.switchTo('ch1', 'p-a', 'manual'); // already active
     expect(stitcher.channelStatuses()[0]!.lastSwitch).toBeNull();
+  });
+
+  it('still switches on command while the active upstream is failing — the controller lever is never gated', async () => {
+    const { stitcher, net } = setup();
+    net.routes[`${NODE_A}/1080p/stream.m3u8`] = () => ({ status: 500 });
+    await expect(stitcher.getMediaPlaylist('ch1', '1080p')).rejects.toBeInstanceOf(UpstreamUnavailableError);
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    const status = stitcher.channelStatuses()[0]!;
+    expect(status.activeUpstreamId).toBe('p-b');
+    expect(status.lastSwitch).toMatchObject({ from: 'p-a', to: 'p-b', reason: 'manual' });
   });
 });
 

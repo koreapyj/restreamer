@@ -141,5 +141,107 @@ export function createServer(deps: ServerDeps): FastifyInstance {
     return { name, lines: tail };
   });
 
+  app.post('/v1/sessions/:name/restarts/reset', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    if (!supervisor.resetSessionRestarts(name)) {
+      return reply.status(404).send({ error: `unknown session: ${name}` });
+    }
+    return { ok: true };
+  });
+
+  /**
+   * Server-Sent Events: replays the ring tail as `event: log` frames (payload
+   * = LogLine), then streams live lines; `event: end` when the Session object
+   * is discarded (config change / removal) — clients reconnect to pick up any
+   * replacement session under the same name. An `invalid` session (no live
+   * Session) gets an empty replay + immediate end, mirroring GET .../log.
+   */
+  app.get('/v1/sessions/:name/log/stream', (req, reply) => {
+    const { name } = req.params as { name: string };
+    const raw = (req.query as { lines?: string }).lines;
+    let tailLines = config.logLines;
+    if (raw !== undefined) {
+      tailLines = Number(raw);
+      if (!Number.isInteger(tailLines) || tailLines < 0) {
+        return reply.status(400).send({ error: `invalid lines parameter: ${raw}` });
+      }
+    }
+    // existence check BEFORE hijacking — the only chance to send a 404
+    if (supervisor.sessionLog(name, 0) === null) {
+      return reply.status(404).send({ error: `unknown session: ${name}` });
+    }
+
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no', // nginx: never buffer SSE
+    });
+    res.write('retry: 3000\n\n');
+
+    const MAX_BUFFERED_BYTES = 256 * 1024;
+    let closed = false;
+    let keepalive: unknown;
+    let unsubscribe: (() => void) | undefined;
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (keepalive !== undefined) clearInterval(keepalive as NodeJS.Timeout);
+      unsubscribe?.();
+      try {
+        res.end();
+      } catch {
+        /* connection already gone */
+      }
+    };
+    const send = (event: string, data: unknown): void => {
+      if (closed) return;
+      // slow client: drop the connection instead of buffering unboundedly
+      if (res.writableLength > MAX_BUFFERED_BYTES) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        cleanup();
+      }
+    };
+
+    // no await between the 404 check above and this call — the event loop
+    // cannot run a reconcile in between, so this cannot race a removal
+    const subscription = supervisor.subscribeSessionLog(name, tailLines, {
+      onLine: (entry) => send('log', entry),
+      onEnd: () => {
+        send('end', {});
+        cleanup();
+      },
+    });
+    if (!subscription) {
+      // unreachable (checked above), but never leave the response hanging
+      cleanup();
+      return;
+    }
+    for (const entry of subscription.tail) send('log', entry);
+    if (!subscription.live) {
+      send('end', {});
+      cleanup();
+      return;
+    }
+    unsubscribe = subscription.unsubscribe;
+    keepalive = setInterval(() => {
+      if (closed) return;
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        cleanup();
+      }
+    }, 25_000);
+    req.raw.on('close', cleanup);
+    req.raw.on('error', cleanup);
+  });
+
   return app;
 }

@@ -261,10 +261,19 @@ test.sequential(
     const restart = await fetch(`${base}/v1/sessions/e2e/restart`, { method: 'POST' });
     expect(restart.status).toBe(200);
     expect(await restart.json()).toEqual({ ok: true });
-    await pollStatus(
+    const restarted = await pollStatus(
       (s) => s.sessions[0]?.state === 'running' && s.sessions[0].restarts >= 1,
       'session running again after restart',
     );
+
+    // restarts-reset: counter zeroed, generation untouched
+    expect((await fetch(`${base}/v1/sessions/nope/restarts/reset`, { method: 'POST' })).status).toBe(404);
+    const reset = await fetch(`${base}/v1/sessions/e2e/restarts/reset`, { method: 'POST' });
+    expect(reset.status).toBe(200);
+    expect(await reset.json()).toEqual({ ok: true });
+    const afterReset = await pollStatus((s) => s.sessions[0]?.restarts === 0, 'restarts back to 0');
+    expect(afterReset.sessions[0]?.state).toBe('running');
+    expect(afterReset.sessions[0]?.ffmpegPid).toBe(restarted.sessions[0]?.ffmpegPid); // not respawned
 
     // full-replacement PUT without the session → stopped, cleaned up, empty status
     const removal = await putDesired(desiredDoc('rev-2', []));
