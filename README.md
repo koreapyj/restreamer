@@ -219,8 +219,11 @@ are pushed. Per host, per channel:
 2. Stop the legacy unit for one channel:
    `systemctl disable --now restreamer@<name>`.
 3. PUT the equivalent session (tvh-controller does this once integrated;
-   until then, by hand — this is the same final contract format). Example for
-   the legacy `at-x` unit (`MODE=ivtc`, `PID=333`):
+   until then, by hand — this is the same final contract format). Pipelines
+   are pushed as pre-rendered ffmpeg argvs by the controller (`raw-argv`
+   template; the daemon substitutes `{OUT_DIR}` and appends the progress
+   channel). Example shape for the legacy `at-x` unit (`PID=333`; the real
+   `ffmpegArgv` is the full ffmpeg command line the controller renders):
 
    ```sh
    curl -sS -X PUT http://<host>:5580/v1/desired \
@@ -234,10 +237,11 @@ are pushed. Per host, per channel:
          "source": { "channelUuid": "<AT-X channel uuid from tvheadend>" },
          "tsreadex": { "programNumber": 333 },
          "pipeline": {
-           "template": "arib-hls",
+           "template": "raw-argv",
            "templateVersion": 1,
-           "video": { "mode": "ivtc" },
-           "audio": [ {}, {} ]
+           "ffmpegArgv": [ "-nostats", "…", "{OUT_DIR}/%v/stream.m3u8" ],
+           "segmentSeconds": 5,
+           "listSize": 120
          }
        }
      ]

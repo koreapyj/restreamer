@@ -197,12 +197,11 @@ const e2eSession: DesiredSession = {
   source: { channelUuid: 'test-uuid', weight: 42 },
   tsreadex: { programNumber: 333 },
   pipeline: {
-    template: 'arib-hls',
+    template: 'raw-argv',
     templateVersion: 1,
-    video: { mode: 'none' },
-    audio: [{}],
-    subtitles: { enabled: false },
-    thumbnail: { enabled: false },
+    // fake-ffmpeg derives its outDir from the `<outDir>/%v/stream.m3u8`
+    // positional arg and honors -progress, like real ffmpeg
+    ffmpegArgv: ['-nostats', '-i', '-', '-f', 'hls', '{OUT_DIR}/%v/stream.m3u8'],
   },
 };
 
@@ -215,13 +214,7 @@ test.sequential(
     expect(empty.sessions).toEqual([]);
     expect(empty.desiredRevision).toBeNull();
     expect(empty.daemonVersion).toBe(VERSION);
-    expect(empty.templates).toEqual(
-      expect.arrayContaining([
-        { id: 'arib-hls', version: 1 },
-        { id: 'raw-argv', version: 1 },
-      ]),
-    );
-    expect(empty.templates).toHaveLength(2);
+    expect(empty.templates).toEqual([{ id: 'raw-argv', version: 1 }]);
     expect((await getJson('/v1/desired')).status).toBe(404);
 
     // rejected PUTs: wrong apiVersion, schema violation, dry-run build failure

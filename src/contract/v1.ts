@@ -95,70 +95,9 @@ export type TsreadexParams = Static<typeof TsreadexParams>;
 // ---------------------------------------------------------------------------
 // Pipeline parameters — discriminated union on `template`
 //
-// The daemon owns each template's filter-graph skeleton, stream mapping,
-// var_stream_map and HLS muxer wiring; the params below are the constrained
-// knobs a profile may fill. Encoder constants (profile/tier/scenario/hvc1
-// tag/cgop/aspect, libfdk_aac, hls_flags set) are template-fixed, not knobs.
+// The controller renders complete ffmpeg argvs and pushes them pre-built;
+// the daemon does not generate filter graphs or encoder settings itself.
 // ---------------------------------------------------------------------------
-
-/** One audio output. Bitrate default is index-dependent ('128k' for the first entry, '64k' for the rest) and therefore applied by the template, not the schema. */
-export const AribHlsAudio = Type.Object({
-  bitrate: Type.Optional(Type.String()),
-  /** volume gain filter */
-  volume: Type.Optional(Type.String({ default: '5dB' })),
-  /** rendition LANGUAGE attribute */
-  language: Type.Optional(Type.String()),
-  /** rendition NAME attribute */
-  name: Type.Optional(Type.String()),
-  isDefault: Type.Optional(Type.Boolean()),
-});
-export type AribHlsAudio = Static<typeof AribHlsAudio>;
-
-/**
- * 'arib-hls' — the production pipeline: MPEG-TS in, QSV HEVC + libfdk_aac +
- * ARIB→ASS subtitles + thumbnail out, browser-playable HLS.
- */
-export const AribHlsParams = Type.Object({
-  template: Type.Literal('arib-hls'),
-  templateVersion: Type.Literal(1),
-  video: Type.Object({
-    /** selects the filter branch + default GOP: ivtc → 24000/1001, deinterlace/none → 30000/1001 */
-    mode: Type.Union([Type.Literal('ivtc'), Type.Literal('deinterlace'), Type.Literal('none')]),
-    codec: Type.Optional(Type.Literal('hevc_qsv', { default: 'hevc_qsv' })),
-    bitrate: Type.Optional(Type.String({ default: '3M' })),
-    /** GOP expression; default derived from `mode` by the template */
-    gop: Type.Optional(Type.String()),
-    /** QSV encode preset */
-    preset: Type.Optional(Type.Integer({ default: 7 })),
-  }),
-  /** 1..4 audio outputs — drives var_stream_map / rendition generation */
-  audio: Type.Array(AribHlsAudio, { minItems: 1, maxItems: 4 }),
-  subtitles: Type.Optional(
-    Type.Object({
-      /** ARIB caption → ASS subtitle playlist */
-      enabled: Type.Optional(Type.Boolean({ default: true })),
-      language: Type.Optional(Type.String()),
-      name: Type.Optional(Type.String()),
-    }),
-  ),
-  thumbnail: Type.Optional(
-    Type.Object({
-      enabled: Type.Optional(Type.Boolean({ default: true })),
-      width: Type.Optional(Type.Integer()),
-      height: Type.Optional(Type.Integer()),
-      intervalSec: Type.Optional(Type.Number()),
-    }),
-  ),
-  hls: Type.Optional(
-    Type.Object({
-      /** hls_time */
-      segmentSeconds: Type.Optional(Type.Number({ default: 5 })),
-      /** hls_list_size */
-      listSize: Type.Optional(Type.Integer({ default: 120 })),
-    }),
-  ),
-});
-export type AribHlsParams = Static<typeof AribHlsParams>;
 
 /**
  * 'raw-argv' — a fully pre-rendered ffmpeg argv, produced by the controller.
@@ -186,7 +125,7 @@ export const RawArgvParams = Type.Object({
 export type RawArgvParams = Static<typeof RawArgvParams>;
 
 /** future pipeline shapes become new union members */
-export const PipelineParams = Type.Union([AribHlsParams, RawArgvParams]);
+export const PipelineParams = Type.Union([RawArgvParams]);
 export type PipelineParams = Static<typeof PipelineParams>;
 
 // ---------------------------------------------------------------------------

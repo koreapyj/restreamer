@@ -158,7 +158,7 @@ describe('Supervisor', () => {
     expect(await store.load()).toEqual(d);
   });
 
-  it('applyDesired accepts a mixed doc (one arib-hls, one raw-argv) and reconciles both', async () => {
+  it('applyDesired accepts a doc with two raw-argv sessions and reconciles both', async () => {
     const sup = makeSupervisor();
     const rawSession = sess('raw-1', {
       pipeline: { template: 'raw-argv', templateVersion: 1, ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'] },

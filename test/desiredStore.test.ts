@@ -19,7 +19,7 @@ const doc: DesiredState = {
       name: 'at-x',
       source: { channelUuid: 'uuid-1' },
       tsreadex: { programNumber: 1064 },
-      pipeline: { template: 'arib-hls', templateVersion: 1, video: { mode: 'ivtc' }, audio: [{}] },
+      pipeline: { template: 'raw-argv', templateVersion: 1, ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'] },
     },
   ],
 };

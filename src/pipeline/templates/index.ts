@@ -17,15 +17,14 @@
  */
 
 /*
- * Pipeline template registry. The daemon owns each template's filter-graph
- * skeleton, stream mapping, var_stream_map and HLS muxer wiring; profiles
- * (via the contract's PipelineParams) only fill constrained knobs. The
- * registry also feeds `/v1/status.templates` and capability matching.
+ * Pipeline template registry. Pipelines arrive as pre-rendered ffmpeg argvs
+ * (the controller owns filter graphs and encoder settings); a template only
+ * finalizes the argv for this session (token substitution, progress channel).
+ * The registry also feeds `/v1/status.templates` and capability matching.
  */
 
 import type { TSchema } from '@sinclair/typebox';
 import type { PipelineParams } from '../../contract/v1.js';
-import { aribHlsTemplate } from './aribHls.js';
 import { rawArgvTemplate } from './rawArgv.js';
 
 export interface TemplateCtx {
@@ -58,7 +57,6 @@ export class UnknownTemplateError extends Error {
 
 /** All templates this daemon can build, keyed by id. */
 export const templates: Readonly<Record<string, PipelineTemplate<PipelineParams> | undefined>> = {
-  [aribHlsTemplate.id]: aribHlsTemplate,
   [rawArgvTemplate.id]: rawArgvTemplate,
 };
 

@@ -55,14 +55,14 @@ import type {
 /** ceiling for a *derived* cleanup delay, guarding against a misconfigured huge listSize */
 const CLEANUP_DELAY_MAX_SEC = 3600;
 
-/** hls_time driving the derived playlist-stall threshold + cleanup delay, whichever template built the session */
+/** hls_time driving the derived playlist-stall threshold + cleanup delay */
 function pipelineSegmentSeconds(p: DesiredSession['pipeline']): number {
-  return p.template === 'arib-hls' ? (p.hls?.segmentSeconds ?? 5) : (p.segmentSeconds ?? 5);
+  return p.segmentSeconds ?? 5;
 }
 
-/** hls_list_size driving the derived cleanup delay, whichever template built the session */
+/** hls_list_size driving the derived cleanup delay */
 function pipelineListSize(p: DesiredSession['pipeline']): number {
-  return p.template === 'arib-hls' ? (p.hls?.listSize ?? 120) : (p.listSize ?? 120);
+  return p.listSize ?? 120;
 }
 
 interface SessionEntry {

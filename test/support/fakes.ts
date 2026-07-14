@@ -261,10 +261,9 @@ export function sampleDesired(overrides: Partial<DesiredSession> & { name?: stri
     source: { channelUuid: 'uuid-1' },
     tsreadex: { programNumber: 1064 },
     pipeline: {
-      template: 'arib-hls',
+      template: 'raw-argv',
       templateVersion: 1,
-      video: { mode: 'ivtc' },
-      audio: [{}, {}],
+      ffmpegArgv: ['-nostats', '-i', '-', '{OUT_DIR}/%v/stream.m3u8'],
     },
     ...overrides,
   };

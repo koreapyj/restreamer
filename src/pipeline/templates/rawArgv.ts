@@ -19,9 +19,8 @@
 /*
  * 'raw-argv' v1 — a fully pre-rendered ffmpeg argv supplied by the controller.
  * The daemon does not interpret the argv; it only substitutes `{OUT_DIR}`
- * tokens and appends the progress channel, mirroring the arib-hls template's
- * only argv addition vs its params (`-progress pipe:3` when ctx.progress is
- * set).
+ * tokens and appends the progress channel (`-progress pipe:3` when
+ * ctx.progress is set — the session layer's only argv addition).
  */
 
 import { RawArgvParams } from '../../contract/v1.js';

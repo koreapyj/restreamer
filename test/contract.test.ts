@@ -19,7 +19,7 @@ import {
   type SwitcherDesiredState as SwitcherDesiredStateT,
 } from '../src/contract/v1.js';
 
-/** mirrors the current production at-x unit: SOURCE=channel, PID=333, MODE=ivtc */
+/** mirrors a production at-x unit: SOURCE=channel, PID=333, controller-rendered argv */
 function atXDoc(): DesiredStateT {
   return {
     apiVersion: 1,
@@ -35,16 +35,25 @@ function atXDoc(): DesiredStateT {
         },
         tsreadex: { programNumber: 333 },
         pipeline: {
-          template: 'arib-hls',
+          template: 'raw-argv',
           templateVersion: 1,
-          video: { mode: 'ivtc', codec: 'hevc_qsv', bitrate: '3M', preset: 7 },
-          audio: [
-            { bitrate: '128k', volume: '5dB', language: 'jpn', name: 'Main', isDefault: true },
-            { bitrate: '64k', volume: '5dB', language: 'jpn', name: 'Sub' },
+          ffmpegArgv: [
+            '-nostats',
+            '-hide_banner',
+            '-i',
+            '-',
+            '-f',
+            'hls',
+            '-hls_time',
+            '5',
+            '-hls_list_size',
+            '120',
+            '-master_pl_name',
+            'playlist.m3u8',
+            '{OUT_DIR}/%v/stream.m3u8',
           ],
-          subtitles: { enabled: true, language: 'jpn' },
-          thumbnail: { enabled: true },
-          hls: { segmentSeconds: 5, listSize: 120 },
+          segmentSeconds: 5,
+          listSize: 120,
         },
       },
     ],
@@ -66,10 +75,9 @@ describe('DesiredState', () => {
           source: { channelUuid: 'abc' },
           tsreadex: { programNumber: 1024 },
           pipeline: {
-            template: 'arib-hls',
+            template: 'raw-argv',
             templateVersion: 1,
-            video: { mode: 'deinterlace' },
-            audio: [{}],
+            ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'],
           },
         },
       ],
@@ -94,18 +102,6 @@ describe('DesiredState', () => {
   it('rejects an unknown pipeline template', () => {
     const doc = atXDoc() as unknown as { sessions: [{ pipeline: { template: string } }] };
     doc.sessions[0].pipeline.template = 'mp4-vod';
-    expect(Value.Check(DesiredState, doc)).toBe(false);
-  });
-
-  it('rejects more than 4 audio entries', () => {
-    const doc = atXDoc();
-    doc.sessions[0]!.pipeline.audio = [{}, {}, {}, {}, {}];
-    expect(Value.Check(DesiredState, doc)).toBe(false);
-  });
-
-  it('rejects an empty audio array', () => {
-    const doc = atXDoc();
-    doc.sessions[0]!.pipeline.audio = [];
     expect(Value.Check(DesiredState, doc)).toBe(false);
   });
 
@@ -137,19 +133,20 @@ describe('DesiredState', () => {
     });
   });
 
-  it('accepts a doc mixing one arib-hls and one raw-argv session', () => {
-    const doc = atXDoc();
-    doc.sessions.push({
-      name: 'raw-x',
-      source: { channelUuid: 'raw-uuid' },
-      tsreadex: { programNumber: 500 },
-      pipeline: {
-        template: 'raw-argv',
-        templateVersion: 1,
-        ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'],
-      },
-    });
-    expect(Value.Check(DesiredState, doc)).toBe(true);
+  it('rejects a legacy arib-hls pipeline (template removed from the union)', () => {
+    const doc = atXDoc() as unknown as { sessions: [{ pipeline: unknown }] };
+    doc.sessions[0].pipeline = {
+      template: 'arib-hls',
+      templateVersion: 1,
+      video: { mode: 'ivtc' },
+      audio: [{}, {}],
+    };
+    expect(Value.Check(DesiredState, doc)).toBe(false);
+    // TypeBox collapses a single-member Type.Union to the member schema, so
+    // the error is the member's own template-literal mismatch; the top-level
+    // 'Expected union value' shape returns once a second variant is added.
+    const messages = [...Value.Errors(DesiredState, doc)].map((e) => e.message);
+    expect(messages).toContain("Expected 'raw-argv'");
   });
 });
 
@@ -244,7 +241,7 @@ describe('StatusResponse / SessionStatus additions', () => {
       startedAt: '2026-07-06T00:00:00.000Z',
       uptimeSec: 60,
       capabilities: ['qsv'],
-      templates: [{ id: 'arib-hls', version: 1 }],
+      templates: [{ id: 'raw-argv', version: 1 }],
       desiredRevision: 'r1',
       sessions: [],
     };

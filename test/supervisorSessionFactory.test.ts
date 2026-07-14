@@ -1,8 +1,7 @@
 /*
  * Supervisor's *default* sessionFactory (the one it builds internally when no
  * SessionFactory is injected) — verifies the SessionSettings.segmentSeconds
- * wiring: arib-hls sessions read `pipeline.hls.segmentSeconds`, raw-argv
- * sessions read `pipeline.segmentSeconds`. Every other Supervisor test in
+ * wiring from `pipeline.segmentSeconds`. Every other Supervisor test in
  * this suite injects a FakeSession (see reconciler.test.ts), which bypasses
  * this settings-construction code entirely — this file is the only place it
  * runs. The real `Session` class is spied on (not faked) so the constructor
@@ -91,7 +90,7 @@ describe('Supervisor default sessionFactory — SessionSettings.segmentSeconds w
     });
   }
 
-  it('raw-argv: reads segmentSeconds from RawArgvParams, not the arib-hls default of 5', async () => {
+  it('raw-argv: reads segmentSeconds from RawArgvParams', async () => {
     const sup = makeSupervisor();
     const session: DesiredSession = {
       name: 'raw-1',
@@ -120,24 +119,5 @@ describe('Supervisor default sessionFactory — SessionSettings.segmentSeconds w
     };
     await sup.applyDesired(doc('rev-1', [session]));
     expect(captured.settings?.segmentSeconds).toBe(5);
-  });
-
-  it('arib-hls: still reads segmentSeconds from pipeline.hls.segmentSeconds (behavior-neutral)', async () => {
-    const sup = makeSupervisor();
-    const session: DesiredSession = {
-      name: 'arib-1',
-      enabled: false,
-      source: { channelUuid: 'uuid-arib' },
-      tsreadex: { programNumber: 1 },
-      pipeline: {
-        template: 'arib-hls',
-        templateVersion: 1,
-        video: { mode: 'ivtc' },
-        audio: [{}],
-        hls: { segmentSeconds: 3 },
-      },
-    };
-    await sup.applyDesired(doc('rev-1', [session]));
-    expect(captured.settings?.segmentSeconds).toBe(3);
   });
 });
