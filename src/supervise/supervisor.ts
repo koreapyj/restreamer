@@ -55,6 +55,16 @@ import type {
 /** ceiling for a *derived* cleanup delay, guarding against a misconfigured huge listSize */
 const CLEANUP_DELAY_MAX_SEC = 3600;
 
+/** hls_time driving the derived playlist-stall threshold + cleanup delay, whichever template built the session */
+function pipelineSegmentSeconds(p: DesiredSession['pipeline']): number {
+  return p.template === 'arib-hls' ? (p.hls?.segmentSeconds ?? 5) : (p.segmentSeconds ?? 5);
+}
+
+/** hls_list_size driving the derived cleanup delay, whichever template built the session */
+function pipelineListSize(p: DesiredSession['pipeline']): number {
+  return p.template === 'arib-hls' ? (p.hls?.listSize ?? 120) : (p.listSize ?? 120);
+}
+
 interface SessionEntry {
   desired: DesiredSession;
   configHash: string;
@@ -127,7 +137,7 @@ export class Supervisor {
             ffmpegPath: this.config.ffmpegPath,
             stallTimeoutSec: this.config.stallTimeoutSec,
             playlistStallSec: this.config.playlistStallSec,
-            segmentSeconds: init.desired.pipeline.hls?.segmentSeconds ?? 5,
+            segmentSeconds: pipelineSegmentSeconds(init.desired.pipeline),
             memoryLimitMb: this.config.memoryLimitMb,
             stopGraceSec: this.config.stopGraceSec,
             logCapacity: this.config.logLines,
@@ -386,10 +396,8 @@ export class Supervisor {
   private resolveCleanupDelayMs(desired: DesiredSession): number {
     const cfg = this.config.cleanupDelaySec;
     if (cfg !== null) return cfg * 1000; // explicit override (0 = immediate)
-    const p = desired.pipeline;
-    const hls = p.template === 'arib-hls' ? p.hls : undefined;
-    const seg = hls?.segmentSeconds ?? 5; // mirror aribHls.ts template defaults
-    const list = hls?.listSize ?? 120;
+    const seg = pipelineSegmentSeconds(desired.pipeline);
+    const list = pipelineListSize(desired.pipeline);
     return Math.min(seg * list, CLEANUP_DELAY_MAX_SEC) * 1000;
   }
 

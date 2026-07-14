@@ -158,6 +158,21 @@ describe('Supervisor', () => {
     expect(await store.load()).toEqual(d);
   });
 
+  it('applyDesired accepts a mixed doc (one arib-hls, one raw-argv) and reconciles both', async () => {
+    const sup = makeSupervisor();
+    const rawSession = sess('raw-1', {
+      pipeline: { template: 'raw-argv', templateVersion: 1, ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'] },
+    });
+    const d = doc('rev-1', [sess('alpha'), rawSession]);
+    await sup.applyDesired(d);
+
+    expect(created).toHaveLength(2);
+    expect(created.every((s) => s.startCalls === 1)).toBe(true);
+    expect(byName(sup, 'alpha')?.state).toBe('running');
+    expect(byName(sup, 'raw-1')?.state).toBe('running');
+    expect(sup.getDesired()).toEqual(d);
+  });
+
   it('no-op PUT (same sessions, new revision) never touches a running session', async () => {
     const sup = makeSupervisor();
     await sup.applyDesired(doc('rev-1', [sess('alpha')]));
@@ -369,6 +384,27 @@ describe('Supervisor', () => {
       await clock.tick(1);
       expect(rmCalls).toEqual(['/media/beta']);
       expect(clock.pending()).toBe(0);
+    });
+
+    it('derives the delay from RawArgvParams.segmentSeconds/listSize for a raw-argv session', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      const rawBeta = sess('beta', {
+        pipeline: {
+          template: 'raw-argv',
+          templateVersion: 1,
+          ffmpegArgv: ['-i', '-'],
+          segmentSeconds: 2,
+          listSize: 60,
+        },
+      });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), rawBeta]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta
+
+      await clock.tick(120_000 - 1); // 2 × 60 = 120s; one ms short
+      expect(rmCalls).toEqual([]);
+      await clock.tick(1);
+      expect(rmCalls).toEqual(['/media/beta']);
     });
 
     it('a non-null cleanupDelaySec overrides the derived delay', async () => {

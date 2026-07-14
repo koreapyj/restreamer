@@ -215,7 +215,13 @@ test.sequential(
     expect(empty.sessions).toEqual([]);
     expect(empty.desiredRevision).toBeNull();
     expect(empty.daemonVersion).toBe(VERSION);
-    expect(empty.templates).toEqual([{ id: 'arib-hls', version: 1 }]);
+    expect(empty.templates).toEqual(
+      expect.arrayContaining([
+        { id: 'arib-hls', version: 1 },
+        { id: 'raw-argv', version: 1 },
+      ]),
+    );
+    expect(empty.templates).toHaveLength(2);
     expect((await getJson('/v1/desired')).status).toBe(404);
 
     // rejected PUTs: wrong apiVersion, schema violation, dry-run build failure

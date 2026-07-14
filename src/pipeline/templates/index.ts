@@ -26,6 +26,7 @@
 import type { TSchema } from '@sinclair/typebox';
 import type { PipelineParams } from '../../contract/v1.js';
 import { aribHlsTemplate } from './aribHls.js';
+import { rawArgvTemplate } from './rawArgv.js';
 
 export interface TemplateCtx {
   /** session output directory (`<serveDir>/<name>`), forward slashes */
@@ -55,15 +56,10 @@ export class UnknownTemplateError extends Error {
   }
 }
 
-/**
- * All templates this daemon can build, keyed by id.
- *
- * PipelineParams is currently a single-member union, so every registered
- * template consumes the full union; when a second template lands, narrow the
- * params type inside `getTemplate` on the `template` discriminant.
- */
+/** All templates this daemon can build, keyed by id. */
 export const templates: Readonly<Record<string, PipelineTemplate<PipelineParams> | undefined>> = {
   [aribHlsTemplate.id]: aribHlsTemplate,
+  [rawArgvTemplate.id]: rawArgvTemplate,
 };
 
 /** id + version lookup; throws UnknownTemplateError so callers can 400 with details */

@@ -7,6 +7,7 @@ import { Value } from '@sinclair/typebox/value';
 import { describe, expect, it } from 'vitest';
 import {
   DesiredState,
+  RawArgvParams,
   SessionStatus,
   SourceCatalogEntry,
   SourcesResponse,
@@ -134,6 +135,53 @@ describe('DesiredState', () => {
       captionMode: 5,
       superimposeMode: 2,
     });
+  });
+
+  it('accepts a doc mixing one arib-hls and one raw-argv session', () => {
+    const doc = atXDoc();
+    doc.sessions.push({
+      name: 'raw-x',
+      source: { channelUuid: 'raw-uuid' },
+      tsreadex: { programNumber: 500 },
+      pipeline: {
+        template: 'raw-argv',
+        templateVersion: 1,
+        ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'],
+      },
+    });
+    expect(Value.Check(DesiredState, doc)).toBe(true);
+  });
+});
+
+describe('RawArgvParams', () => {
+  function minimal(): RawArgvParams {
+    return {
+      template: 'raw-argv',
+      templateVersion: 1,
+      ffmpegArgv: ['-i', '-', '{OUT_DIR}/%v/stream.m3u8'],
+    };
+  }
+
+  it('accepts a valid minimal payload', () => {
+    expect(Value.Check(RawArgvParams, minimal())).toBe(true);
+  });
+
+  it('fills segmentSeconds=5 and listSize=120 via Value.Default', () => {
+    const filled = Value.Default(RawArgvParams, Value.Clone(minimal())) as RawArgvParams;
+    expect(filled.segmentSeconds).toBe(5);
+    expect(filled.listSize).toBe(120);
+  });
+
+  it('rejects an empty ffmpegArgv', () => {
+    expect(Value.Check(RawArgvParams, { ...minimal(), ffmpegArgv: [] })).toBe(false);
+  });
+
+  it('rejects an empty-string token', () => {
+    expect(Value.Check(RawArgvParams, { ...minimal(), ffmpegArgv: ['-i', ''] })).toBe(false);
+  });
+
+  it('rejects templateVersion 2', () => {
+    expect(Value.Check(RawArgvParams, { ...minimal(), templateVersion: 2 })).toBe(false);
   });
 });
 
