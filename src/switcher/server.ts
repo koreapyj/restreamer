@@ -34,7 +34,6 @@ import type { SwitcherStore } from './desiredStore.js';
 import {
   type Logger,
   type Stitcher,
-  SAFE_SEGMENT_FILE,
   UnknownChannelError,
   UnknownUpstreamError,
   UnknownVariantError,
@@ -81,9 +80,7 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
 
   // Browsers play the switcher's playlists cross-origin, and virtual
   // playlists must never be cached — a stale one desyncs the virtual
-  // MEDIA-SEQUENCE. Applied to every /hls response, including errors; a
-  // route that sets its own Cache-Control (the segment redirect, which IS
-  // cacheable) wins over the no-store default.
+  // MEDIA-SEQUENCE. Applied to every /hls response, including errors.
   app.addHook('onSend', async (req, reply, payload) => {
     if (req.url.startsWith('/hls/')) {
       void reply.header('access-control-allow-origin', '*');
@@ -170,34 +167,6 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
         const text = await stitcher.getMediaPlaylist(req.params.slug, req.params.variant);
         return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
       } catch (err) {
-        return sendHlsError(reply, err);
-      }
-    },
-  );
-
-  // Segment redirect: media playlists in 'redirect' mode reference
-  // `seg/<upstreamId>/<file>` relative to themselves, which lands here. The
-  // switcher never proxies segment bytes — it answers with a 302 to the
-  // upstream node. A given (upstream, variant, file) never changes location,
-  // so the redirect itself is long-cacheable (unlike the playlists).
-  app.get<{ Params: { slug: string; variant: string; upstreamId: string; file: string } }>(
-    '/hls/:slug/:variant/seg/:upstreamId/:file',
-    async (req, reply) => {
-      const { slug, variant, upstreamId, file } = req.params;
-      // flat filenames only — no slashes (also catches %2F/%2E-encoded
-      // traversal, decoded by the router before we see it) and no `.`/`..`
-      if (!SAFE_SEGMENT_FILE.test(file) || !SAFE_SEGMENT_FILE.test(variant)) {
-        return reply.code(404).send({ error: 'not found' });
-      }
-      try {
-        const base = stitcher.upstreamUrl(slug, upstreamId);
-        return reply
-          .code(302)
-          .header('location', `${base}/${variant}/${file}`)
-          .header('cache-control', 'public, max-age=86400')
-          .send();
-      } catch (err) {
-        if (err instanceof UnknownUpstreamError) return reply.code(404).send({ error: err.message });
         return sendHlsError(reply, err);
       }
     },

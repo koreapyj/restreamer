@@ -162,20 +162,11 @@ playlists is **relative**, so a reverse proxy can mount the switcher under
 any path prefix:
 
 - master playlist → `<variant>/stream.m3u8` (variant streams and
-  audio/subtitle rendition `URI="…"` attributes alike);
-- media playlists → `seg/<upstreamId>/<file>` per segment (and
-  `EXT-X-MAP`), resolved by
-  `GET /hls/<slug>/<variant>/seg/<upstreamId>/<file>` which answers with a
-  302 to the upstream node (`Cache-Control: public, max-age=86400` — a
-  segment's location never changes). Segment bytes still flow node → viewer
-  directly; the switcher serves only playlists and redirects. The upstream
-  id baked into each URI keeps pre-failover cached playlists playable: old
-  segments keep redirecting to the old upstream after a switch.
-
-Set `segmentUrls: upstream` in `switcher.yaml` to embed absolute upstream
-node URLs in media playlists instead (no per-segment redirect round-trip;
-viewers must then reach the upstream nodes under exactly those URLs). Master
-playlists are relative in both modes.
+  audio/subtitle rendition `URI="…"` attributes alike), always relative;
+- media playlists → segment and `EXT-X-MAP` URIs are absolute upstream node
+  URLs. Segment bytes flow node → viewer directly; the switcher serves only
+  playlists, never segment bytes. Viewers must be able to reach the upstream
+  nodes under exactly those URLs.
 
 ## Switcher deployment (Kubernetes)
 

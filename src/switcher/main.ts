@@ -47,7 +47,6 @@ async function main(): Promise<void> {
   const stitcher = new Stitcher({
     cacheTtlMs: config.cacheTtlMs,
     stallGraceSec: config.stallGraceSec,
-    segmentUrls: config.segmentUrls,
     logger: console,
     onSelectionsChanged: persist,
   });

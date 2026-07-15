@@ -12,7 +12,6 @@ import {
   UnknownChannelError,
   UnknownUpstreamError,
   UpstreamUnavailableError,
-  type SegmentUrlMode,
   type SelectionMap,
 } from '../../src/switcher/stitch.js';
 import {
@@ -28,6 +27,7 @@ import {
   mediaPlaylist,
   segEntries,
   segName,
+  segPrefix,
   segmentUrisOf,
   seqOf,
   type LiveOpts,
@@ -36,7 +36,7 @@ import {
 /** virtual sequence base for segmentSeconds=5 */
 const timeBase = (ms: number) => Math.floor(ms / 1000 / 5);
 
-function setup(opts: { aOpts?: LiveOpts; bOpts?: LiveOpts; segmentUrls?: SegmentUrlMode } = {}) {
+function setup(opts: { aOpts?: LiveOpts; bOpts?: LiveOpts } = {}) {
   const clock = { nowMs: T0 + 1000 };
   const net = makeFetch();
   const aOpts = liveUpstream(net, NODE_A, clock, opts.aOpts ?? {});
@@ -45,7 +45,6 @@ function setup(opts: { aOpts?: LiveOpts; bOpts?: LiveOpts; segmentUrls?: Segment
   const stitcher = new Stitcher({
     cacheTtlMs: 2000,
     stallGraceSec: 10,
-    ...(opts.segmentUrls !== undefined ? { segmentUrls: opts.segmentUrls } : {}),
     fetchImpl: net.fetchImpl,
     now: () => clock.nowMs,
     onSelectionsChanged: () => {
@@ -57,26 +56,24 @@ function setup(opts: { aOpts?: LiveOpts; bOpts?: LiveOpts; segmentUrls?: Segment
 }
 
 describe('master playlist rewriting', () => {
-  for (const segmentUrls of ['redirect', 'upstream'] as const) {
-    it(`keeps variant and audio/subtitle rendition URIs relative in ${segmentUrls} mode, the rest verbatim`, async () => {
-      const { stitcher } = setup({ segmentUrls });
-      const text = await stitcher.getMasterPlaylist('ch1');
-      expect(text).toContain('\n1080p/stream.m3u8');
-      expect(text).toContain('URI="arib_1/stream.m3u8"');
-      expect(text).toContain('URI="arib_2/stream.m3u8"');
-      expect(text).toContain('URI="arib_ass/stream.m3u8"');
-      // relative to the master's own URL: no host, no leading slash, no /hls prefix
-      expect(text).not.toContain('/hls/');
-      expect(text).not.toMatch(/^\//m);
-      expect(text).not.toMatch(/URI="\//);
-      // attribute lists untouched apart from URI
-      expect(text).toContain('TYPE=AUDIO,GROUP-ID="audio",NAME="arib_1",DEFAULT=YES,LANGUAGE="ja"');
-      expect(text).toContain(
-        '#EXT-X-STREAM-INF:BANDWIDTH=3500000,CODECS="hvc1.1.6.L123.B0,mp4a.40.2",RESOLUTION=1920x1080,AUDIO="audio",SUBTITLES="arib"',
-      );
-      expect(text).not.toContain('node-a');
-    });
-  }
+  it('keeps variant and audio/subtitle rendition URIs relative, the rest verbatim', async () => {
+    const { stitcher } = setup();
+    const text = await stitcher.getMasterPlaylist('ch1');
+    expect(text).toContain('\n1080p/stream.m3u8');
+    expect(text).toContain('URI="arib_1/stream.m3u8"');
+    expect(text).toContain('URI="arib_2/stream.m3u8"');
+    expect(text).toContain('URI="arib_ass/stream.m3u8"');
+    // relative to the master's own URL: no host, no leading slash, no /hls prefix
+    expect(text).not.toContain('/hls/');
+    expect(text).not.toMatch(/^\//m);
+    expect(text).not.toMatch(/URI="\//);
+    // attribute lists untouched apart from URI
+    expect(text).toContain('TYPE=AUDIO,GROUP-ID="audio",NAME="arib_1",DEFAULT=YES,LANGUAGE="ja"');
+    expect(text).toContain(
+      '#EXT-X-STREAM-INF:BANDWIDTH=3500000,CODECS="hvc1.1.6.L123.B0,mp4a.40.2",RESOLUTION=1920x1080,AUDIO="audio",SUBTITLES="arib"',
+    );
+    expect(text).not.toContain('node-a');
+  });
 
   it('rejects unknown slugs', async () => {
     const { stitcher } = setup();
@@ -85,27 +82,8 @@ describe('master playlist rewriting', () => {
 });
 
 describe('media playlist rewriting', () => {
-  it('rewrites segment and EXT-X-MAP URIs to relative seg/<upstreamId>/<file> by default and passes PDT/EXTINF/TARGETDURATION through', async () => {
+  it('absolutizes segment and EXT-X-MAP URIs against the upstream and passes PDT/EXTINF/TARGETDURATION through', async () => {
     const { stitcher, net, clock } = setup();
-    const firstPdt = T0 - 30_000;
-    net.routes[`${NODE_A}/1080p/stream.m3u8`] = () =>
-      mediaPlaylist({ mediaSeq: 100, firstPdtMs: firstPdt, count: 6, map: 'init.mp4' });
-    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(text).toContain('#EXT-X-MAP:URI="seg/p-a/init.mp4"');
-    expect(segmentUrisOf(text)).toEqual(
-      [0, 1, 2, 3, 4, 5].map((i) => `seg/p-a/${segName(firstPdt + i * 5000)}`),
-    );
-    expect(text).not.toContain('node-a'); // fully relative — mountable anywhere
-    expect(text).toContain('#EXT-X-TARGETDURATION:5');
-    expect(text).toContain('#EXTINF:5.000000,');
-    expect(text).toContain(`#EXT-X-PROGRAM-DATE-TIME:${new Date(firstPdt).toISOString()}`);
-    // raw sequence 100 replaced by the time-derived virtual sequence
-    expect(seqOf(text)).toBe(timeBase(clock.nowMs));
-    expect(discSeqOf(text)).toBe(0);
-  });
-
-  it("absolutizes segment and EXT-X-MAP URIs against the upstream in 'upstream' mode (legacy shape)", async () => {
-    const { stitcher, net, clock } = setup({ segmentUrls: 'upstream' });
     const firstPdt = T0 - 30_000;
     net.routes[`${NODE_A}/1080p/stream.m3u8`] = () =>
       mediaPlaylist({ mediaSeq: 100, firstPdtMs: firstPdt, count: 6, map: 'init.mp4' });
@@ -114,7 +92,10 @@ describe('media playlist rewriting', () => {
     expect(segmentUrisOf(text)).toEqual(
       [0, 1, 2, 3, 4, 5].map((i) => `${NODE_A}/1080p/${segName(firstPdt + i * 5000)}`),
     );
-    expect(text).not.toContain('seg/');
+    expect(text).toContain('#EXT-X-TARGETDURATION:5');
+    expect(text).toContain('#EXTINF:5.000000,');
+    expect(text).toContain(`#EXT-X-PROGRAM-DATE-TIME:${new Date(firstPdt).toISOString()}`);
+    // raw sequence 100 replaced by the time-derived virtual sequence
     expect(seqOf(text)).toBe(timeBase(clock.nowMs));
     expect(discSeqOf(text)).toBe(0);
   });
@@ -123,20 +104,20 @@ describe('media playlist rewriting', () => {
     const { stitcher, clock } = setup();
     const before = await stitcher.getMediaPlaylist('ch1', '1080p');
     // a viewer caching this playlist can still resolve every segment via p-a
-    expect(segmentUrisOf(before).every((u) => u.startsWith('seg/p-a/'))).toBe(true);
+    expect(segmentUrisOf(before).every((u) => u.startsWith(segPrefix(NODE_A)))).toBe(true);
 
     stitcher.switchTo('ch1', 'p-b', 'manual');
     clock.nowMs = T0 + 7000;
     const after = await stitcher.getMediaPlaylist('ch1', '1080p');
     // the window did NOT collapse: the p-a tail is retained ahead of the new p-b head
-    expect(countFor(after, 'p-a')).toBeGreaterThan(0);
-    expect(segmentUrisOf(after).at(-1)).toContain('seg/p-b/');
+    expect(countFor(after, NODE_A)).toBeGreaterThan(0);
+    expect(segmentUrisOf(after).at(-1)).toContain(segPrefix(NODE_B));
 
     // after ~one window of new segments the retained tail has drained out
     clock.nowMs = T0 + 45_000;
     const drained = await stitcher.getMediaPlaylist('ch1', '1080p');
     expect(segmentUrisOf(drained).length).toBeGreaterThan(0);
-    expect(segmentUrisOf(drained).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    expect(segmentUrisOf(drained).every((u) => u.startsWith(segPrefix(NODE_B)))).toBe(true);
   });
 });
 
@@ -192,7 +173,7 @@ describe('virtual MEDIA-SEQUENCE', () => {
     expect(status.activeUpstreamId).toBe('p-b');
     expect(status.lastSwitch).toMatchObject({ to: 'p-b', reason: 'manual', from: null });
     const text = await stitcher2.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(text)[0]).toContain('seg/p-b/');
+    expect(segmentUrisOf(text)[0]).toContain(segPrefix(NODE_B));
   });
 });
 
@@ -242,8 +223,8 @@ describe('served-window retention', () => {
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
     const uris = segmentUrisOf(text);
     expect(uris.length).toBeGreaterThanOrEqual(6); // NOT collapsed to ~1 (the bug)
-    expect(countFor(text, 'p-a')).toBeGreaterThan(0); // outgoing tail retained
-    expect(uris.at(-1)).toContain('seg/p-b/'); // newest is the new upstream
+    expect(countFor(text, NODE_A)).toBeGreaterThan(0); // outgoing tail retained
+    expect(uris.at(-1)).toContain(segPrefix(NODE_B)); // newest is the new upstream
     expect(discCount(text)).toBe(1);
   });
 
@@ -258,9 +239,9 @@ describe('served-window retention', () => {
       clock.nowMs = T0 + 1000 + step * 5000;
       const text = await stitcher.getMediaPlaylist('ch1', '1080p');
       expect(segmentUrisOf(text)).toHaveLength(6); // constant window
-      const a = countFor(text, 'p-a');
+      const a = countFor(text, NODE_A);
       expect(a).toBeLessThan(prevA); // exactly one p-a drained each step
-      expect(countFor(text, 'p-b')).toBe(6 - a);
+      expect(countFor(text, NODE_B)).toBe(6 - a);
       const seq = seqOf(text);
       expect(seq).toBeGreaterThan(prevSeq); // media-sequence monotonic + contiguous
       prevA = a;
@@ -278,7 +259,7 @@ describe('served-window retention', () => {
       clock.nowMs = T0 + 1000 + step * 5000;
       text = await stitcher.getMediaPlaylist('ch1', '1080p');
     }
-    expect(segmentUrisOf(text).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    expect(segmentUrisOf(text).every((u) => u.startsWith(segPrefix(NODE_B)))).toBe(true);
     expect(discCount(text)).toBe(0); // the splice discontinuity aged out
     expect(discSeqOf(text)).toBe(1);
     const s1 = seqOf(text);
@@ -294,8 +275,8 @@ describe('served-window retention', () => {
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
     // B offers only 1 segment, but the window is held at the pre-switch length
     expect(segmentUrisOf(text).length).toBeGreaterThanOrEqual(6);
-    expect(countFor(text, 'p-a')).toBe(5);
-    expect(countFor(text, 'p-b')).toBe(1);
+    expect(countFor(text, NODE_A)).toBe(5);
+    expect(countFor(text, NODE_B)).toBe(1);
   });
 
   it('switches back to the original upstream (A→B→A) monotonically', async () => {
@@ -308,7 +289,7 @@ describe('served-window retention', () => {
     clock.nowMs = T0 + 21_000;
     const back = await stitcher.getMediaPlaylist('ch1', '1080p');
     expect(seqOf(back)).toBeGreaterThan(midSeq); // monotonic across both switches
-    expect(segmentUrisOf(back).at(-1)).toContain('seg/p-a/'); // newest is p-a again
+    expect(segmentUrisOf(back).at(-1)).toContain(segPrefix(NODE_A)); // newest is p-a again
     expect(discCount(back)).toBeGreaterThanOrEqual(1); // a fresh discontinuity on re-entry
   });
 
@@ -334,7 +315,7 @@ describe('served-window retention', () => {
     expect(segmentUrisOf(text).length).toBeGreaterThanOrEqual(6); // never collapsed
     expect(discCount(text)).toBeGreaterThanOrEqual(1);
     expect(discCount(text)).toBeLessThanOrEqual(2); // at most two in-window boundaries
-    expect(segmentUrisOf(text).at(-1)).toContain('seg/p-c/');
+    expect(segmentUrisOf(text).at(-1)).toContain(segPrefix(NODE_C));
   });
 
   it('rebuilds from the active upstream after a restart mid-drain', async () => {
@@ -356,7 +337,7 @@ describe('served-window retention', () => {
     stitcher2.applyDesired(desiredDoc(), selections);
     const text = await stitcher2.getMediaPlaylist('ch1', '1080p');
     // clean re-window from the active upstream — monotonic, no spurious boundary
-    expect(segmentUrisOf(text).every((u) => u.startsWith('seg/p-b/'))).toBe(true);
+    expect(segmentUrisOf(text).every((u) => u.startsWith(segPrefix(NODE_B)))).toBe(true);
     expect(seqOf(text)).toBe(timeBase(clock.nowMs));
     expect(discCount(text)).toBe(0);
   });
@@ -372,16 +353,16 @@ describe('PDT-aligned splice', () => {
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
     // the new upstream's own segments are only those PAST the splice point —
     // nothing already covered by the old upstream is replayed under the new id
-    const bEntries = segEntries(text).filter((e) => e.uri.startsWith('seg/p-b/'));
+    const bEntries = segEntries(text).filter((e) => e.uri.startsWith(segPrefix(NODE_B)));
     expect(bEntries.length).toBeGreaterThan(0);
     for (const e of bEntries) expect(e.pdt + 5000).toBeGreaterThan(T0);
     expect(Math.min(...bEntries.map((e) => e.pdt))).toBe(T0); // resumes exactly at the splice point
 
     // the retained p-a tail sits AHEAD of the p-b head (continuous window)
     const uris = segmentUrisOf(text);
-    const firstB = uris.findIndex((u) => u.startsWith('seg/p-b/'));
+    const firstB = uris.findIndex((u) => u.startsWith(segPrefix(NODE_B)));
     expect(firstB).toBeGreaterThan(0);
-    expect(uris.slice(0, firstB).every((u) => u.startsWith('seg/p-a/'))).toBe(true);
+    expect(uris.slice(0, firstB).every((u) => u.startsWith(segPrefix(NODE_A)))).toBe(true);
   });
 });
 
@@ -406,7 +387,7 @@ describe('health probing (no autonomous failover)', () => {
     const { stitcher, aOpts } = setup();
     aOpts.staleSec = 60; // lag 60s > 3×5 + 10 = 25s
     const text = await stitcher.getMediaPlaylist('ch1', '1080p');
-    expect(segmentUrisOf(text)[0]).toContain('seg/p-a/'); // still serving the stale active upstream
+    expect(segmentUrisOf(text)[0]).toContain(segPrefix(NODE_A)); // still serving the stale active upstream
     const status = stitcher.channelStatuses()[0]!;
     expect(status.activeUpstreamId).toBe('p-a');
     expect(status.lastSwitch).toBeNull();
@@ -437,7 +418,7 @@ describe('health probing (no autonomous failover)', () => {
     clock.nowMs += 3000; // past the micro-cache warmed by the probe
     aOpts.staleSec = 120;
     const text = await stitcher.getMediaPlaylist('ch1', '1080p'); // stale but fetchable → still served
-    expect(segmentUrisOf(text)[0]).toContain('seg/p-a/');
+    expect(segmentUrisOf(text)[0]).toContain(segPrefix(NODE_A));
     expect(stitcher.channelStatuses()[0]!.activeUpstreamId).toBe('p-a');
   });
 

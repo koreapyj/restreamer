@@ -34,7 +34,7 @@ describe('loadSwitcherConfig', () => {
       cacheTtlMs: 2000,
       probeIntervalMs: 15_000,
       stallGraceSec: 10,
-      segmentUrls: 'redirect',
+      segmentUrls: 'upstream',
     });
   });
 
@@ -51,6 +51,10 @@ describe('loadSwitcherConfig', () => {
 
   it('rejects an unknown segmentUrls mode', () => {
     expect(() => loadSwitcherConfig(writeConfig('segmentUrls: proxy\n'))).toThrow(/invalid config/);
+  });
+
+  it('rejects the removed redirect mode loudly instead of silently ignoring it', () => {
+    expect(() => loadSwitcherConfig(writeConfig('segmentUrls: redirect\n'))).toThrow(/invalid config/);
   });
 
   it('resolves the config path from $SWITCHER_CONFIG', () => {

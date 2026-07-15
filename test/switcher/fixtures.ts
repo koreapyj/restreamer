@@ -174,9 +174,12 @@ export const pdtsOf = (text: string): number[] =>
 export const segmentUrisOf = (text: string): string[] =>
   text.split('\n').filter((l) => l !== '' && !l.startsWith('#'));
 
-/** count of served segment URIs baked with the given upstream id (redirect mode) */
-export const countFor = (text: string, upstreamId: string): number =>
-  segmentUrisOf(text).filter((u) => u.startsWith(`seg/${upstreamId}/`)).length;
+/** absolute-URL prefix segment/EXT-X-MAP URIs get rewritten to for a given upstream base + variant */
+export const segPrefix = (base: string, variant = '1080p'): string => `${base}/${variant}/`;
+
+/** count of served segment URIs sourced from the given upstream (identified by its base URL) */
+export const countFor = (text: string, upstreamBase: string, variant = '1080p'): number =>
+  segmentUrisOf(text).filter((u) => u.startsWith(segPrefix(upstreamBase, variant))).length;
 
 /** each segment URI paired with its preceding PROGRAM-DATE-TIME (NaN if none) */
 export const segEntries = (text: string): { pdt: number; uri: string }[] => {

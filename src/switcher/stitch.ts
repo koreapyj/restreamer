@@ -25,20 +25,12 @@
  *   - master:  variant/rendition URIs kept RELATIVE to the master's own URL
  *              (`<variant>/stream.m3u8`) so they resolve to the switcher's
  *              media routes wherever a reverse proxy mounts it,
- *   - media:   segment / EXT-X-MAP URIs rewritten per `segmentUrls`:
- *                'redirect' (default) — RELATIVE `seg/<upstreamId>/<file>`,
- *                resolving to the switcher's redirect route which 302s to the
- *                upstream. The upstream id is baked into each URI at render
- *                time so a viewer holding a pre-failover cached playlist can
- *                still fetch old-upstream segments after a switch (they would
- *                404 on the new upstream).
- *                'upstream' — ABSOLUTE upstream URLs (no per-segment redirect
- *                round-trip; playlists are tied to the upstream host).
- *              Either way segment bytes flow node→viewer directly (the
- *              switcher serves only small text and redirects), and
- *              MEDIA-SEQUENCE / DISCONTINUITY-SEQUENCE are replaced by
- *              virtual values with an EXT-X-DISCONTINUITY spliced in at
- *              switch points.
+ *   - media:   segment / EXT-X-MAP URIs rewritten to ABSOLUTE upstream URLs
+ *              (playlists are tied to the upstream host; viewers fetch
+ *              segment bytes node→viewer directly — the switcher serves only
+ *              small text), and MEDIA-SEQUENCE / DISCONTINUITY-SEQUENCE are
+ *              replaced by virtual values with an EXT-X-DISCONTINUITY
+ *              spliced in at switch points.
  *
  * ── Served-window buffer (retain the outgoing tail across a switch) ─────────
  *
@@ -60,8 +52,8 @@
  * discontinuity and drains them one-per-new-segment, so the window stays a
  * constant size and players keep their position — instead of the served
  * playlist collapsing to the new upstream's post-splice remainder. Retained
- * segment URIs keep pointing at the outgoing upstream (`seg/<old-id>/…`), which
- * stay resolvable because the node defers deleting a removed session's HLS
+ * segment URIs keep pointing at the outgoing upstream's absolute URL, which
+ * stays resolvable because the node defers deleting a removed session's HLS
  * window for ≈ segmentSeconds × listSize (the daemon's cleanupDelaySec) — the
  * same horizon over which the tail drains here.
  *
@@ -241,32 +233,13 @@ function rewriteUriAttr(line: string, rewrite: (uri: string) => string): string 
   return line.replace(/URI="([^"]*)"/, (_m, uri: string) => `URI="${rewrite(uri)}"`);
 }
 
-/** how media-playlist segment / EXT-X-MAP URIs are emitted (see module header) */
-export type SegmentUrlMode = 'redirect' | 'upstream';
-
 /**
- * Filenames the segment redirect route accepts: flat names only — no slashes
- * (no path traversal, no subdirectories) and no `.`/`..` path steps. Shared
- * with server.ts's route guard so the playlist rewriter never emits a
- * `seg/…` URI the route would reject.
+ * Builds the segment / EXT-X-MAP URI rewriter for one upstream + variant:
+ * everything is absolutized against the upstream base (relative URIs get the
+ * base prepended; already-absolute URIs pass through verbatim).
  */
-export const SAFE_SEGMENT_FILE = /^(?!\.\.?$)[\w.\-]+$/;
-
-/**
- * Builds the segment / EXT-X-MAP URI rewriter for one upstream + variant.
- * redirect mode: flat relative filenames become `seg/<upstreamId>/<file>`
- * (resolved by the switcher's 302 route); anything the route could not serve
- * (absolute URIs, paths with directories) falls back to the absolute upstream
- * form. upstream mode: everything absolutized against the upstream base. The
- * upstream id is baked in per-URI so a segment stays resolvable after a switch
- * moves the active upstream away (the retained-window drain relies on this).
- */
-function segmentRewriter(base: string, mode: SegmentUrlMode, upstreamId: string): (uri: string) => string {
-  const abs = (uri: string) => (isAbsoluteUri(uri) ? uri : `${base}/${uri}`);
-  return mode === 'redirect'
-    ? (uri: string) =>
-        !isAbsoluteUri(uri) && SAFE_SEGMENT_FILE.test(uri) ? `seg/${upstreamId}/${uri}` : abs(uri)
-    : abs;
+function segmentRewriter(base: string): (uri: string) => string {
+  return (uri: string) => (isAbsoluteUri(uri) ? uri : `${base}/${uri}`);
 }
 
 /**
@@ -373,8 +346,6 @@ interface CacheEntry {
 export interface StitcherOptions {
   cacheTtlMs: number;
   stallGraceSec: number;
-  /** media-playlist segment URI shape (default 'redirect', see module header) */
-  segmentUrls?: SegmentUrlMode;
   fetchImpl?: typeof fetch;
   /** injectable clock (ms since epoch) */
   now?: () => number;
@@ -388,7 +359,6 @@ const NULL_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 export class Stitcher {
   private readonly cacheTtlMs: number;
   private readonly stallGraceSec: number;
-  private readonly segmentUrls: SegmentUrlMode;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly logger: Logger;
@@ -402,7 +372,6 @@ export class Stitcher {
   constructor(opts: StitcherOptions) {
     this.cacheTtlMs = opts.cacheTtlMs;
     this.stallGraceSec = opts.stallGraceSec;
-    this.segmentUrls = opts.segmentUrls ?? 'redirect';
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.logger = opts.logger ?? NULL_LOGGER;
@@ -617,7 +586,7 @@ export class Stitcher {
     }
     const state = vs;
 
-    const rewrite = segmentRewriter(`${trimSlash(upstream.url)}/${variant}`, this.segmentUrls, upstream.id);
+    const rewrite = segmentRewriter(`${trimSlash(upstream.url)}/${variant}`);
     const prevLen = state.buf.length;
     const boundary = state.lastUpstreamId !== null && state.lastUpstreamId !== upstream.id;
     const hasPdt = parsed.segments.some((s) => s.pdtMs !== null);
@@ -681,21 +650,6 @@ export class Stitcher {
     }
     if (parsed.endList) out.push('#EXT-X-ENDLIST');
     return `${out.join('\n')}\n`;
-  }
-
-  /**
-   * Base URL of a channel's upstream, for the segment redirect route
-   * (`GET /hls/:slug/:variant/seg/:upstreamId/:file` → 302 to
-   * `<url>/<variant>/<file>`). An upstream that disappeared from the desired
-   * doc while its segments are still referenced by a viewer's cached playlist
-   * window throws UnknownUpstreamError (→ 404 upstairs) — acceptable: the
-   * live window is ~10 min and desired-state changes are rare.
-   */
-  upstreamUrl(slug: string, upstreamId: string): string {
-    const ch = this.requireChannel(slug);
-    const up = ch.channel.upstreams.find((u) => u.id === upstreamId);
-    if (!up) throw new UnknownUpstreamError(`unknown upstream ${upstreamId} for channel ${slug}`);
-    return trimSlash(up.url);
   }
 
   // -------------------------------------------------------------------------
