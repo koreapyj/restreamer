@@ -429,29 +429,43 @@ describe('Supervisor', () => {
       expect(clock.pending()).toBe(0);
     });
 
-    it('re-adding a session before its deletion fires cancels the deletion (name reuse)', async () => {
+    it('re-adding a session before its deletion fires rms the stale dir immediately and starts fresh', async () => {
       const clock = manualTimers();
       const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
       await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
       await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → schedule
       await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add before fire
 
-      expect(clock.pending()).toBe(0); // timer disarmed
-      await clock.tick(600_000);
-      expect(rmCalls).toEqual([]); // dir was never deleted — reused by the new session
+      expect(clock.pending()).toBe(0); // original timer disarmed
+      expect(rmCalls).toEqual(['/media/beta']); // stale dir removed before the revived session started
       expect(byName(sup, 'beta')?.state).toBe('running');
+
+      await clock.tick(600_000); // past the original deadline
+      expect(rmCalls).toEqual(['/media/beta']); // the disarmed timer never fires a second rm
     });
 
-    it('rapid remove→add→remove reschedules and deletes exactly once', async () => {
+    it('rapid remove→add→remove rms the stale dir on revival, then again after the final delay', async () => {
       const clock = manualTimers();
       const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
       await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
-      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove (token 1)
-      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add (cancel)
-      await sup.applyDesired(doc('rev-4', [sess('alpha')])); // remove again (token 2)
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove (token 1) → schedule
+      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add → immediate rm, fresh start
+      expect(rmCalls).toEqual(['/media/beta']);
+      await sup.applyDesired(doc('rev-4', [sess('alpha')])); // remove again (token 2) → schedule
 
       await clock.tick(600_000);
-      expect(rmCalls).toEqual(['/media/beta']); // exactly one deletion
+      expect(rmCalls).toEqual(['/media/beta', '/media/beta']); // revival rm + final delayed rm
+    });
+
+    it('in-place replace (hash change, no removal in between) does not rm the dir', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha', { tsreadex: { programNumber: 2064 } })]));
+
+      expect(rmCalls).toEqual([]);
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual([]);
     });
 
     it('stopAll flushes pending deletions synchronously', async () => {

@@ -328,9 +328,18 @@ export class Supervisor {
     const desiredByName = new Map<string, DesiredSession>();
     for (const session of this.desired?.sessions ?? []) desiredByName.set(session.name, session);
 
-    // a name that is desired again cancels any pending deletion of its dir — the
-    // (re)created session legitimately reuses serveDir/<name> (as restart does)
-    for (const name of desiredByName.keys()) this.cancelDeletion(name);
+    // a name that is desired again while its dir's deletion is still pending
+    // (the on-demand idle-stop → viewer-returns pattern) must not resume into
+    // that stale directory — disarm the timer and rm it now, so the revived
+    // session's create/start below starts a fresh dir instead of appending
+    // onto a playlist a player may still be reading
+    for (const name of desiredByName.keys()) {
+      const pending = this.pendingDeletions.get(name);
+      if (!pending) continue;
+      this.timers.clearTimeout(pending.timer);
+      this.pendingDeletions.delete(name);
+      await this.rmOutDir(pending.outDir);
+    }
 
     // removed → graceful stop, then rm -rf outDir (deferred by cleanupDelaySec)
     for (const [name, entry] of [...this.sessions]) {
