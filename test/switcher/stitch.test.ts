@@ -12,7 +12,6 @@ import {
   UnknownChannelError,
   UnknownUpstreamError,
   UpstreamUnavailableError,
-  type SelectionMap,
 } from '../../src/switcher/stitch.js';
 import {
   NODE_A,
@@ -41,18 +40,14 @@ function setup(opts: { aOpts?: LiveOpts; bOpts?: LiveOpts } = {}) {
   const net = makeFetch();
   const aOpts = liveUpstream(net, NODE_A, clock, opts.aOpts ?? {});
   const bOpts = liveUpstream(net, NODE_B, clock, opts.bOpts ?? {});
-  let selectionChanges = 0;
   const stitcher = new Stitcher({
     cacheTtlMs: 2000,
     stallGraceSec: 10,
     fetchImpl: net.fetchImpl,
     now: () => clock.nowMs,
-    onSelectionsChanged: () => {
-      selectionChanges += 1;
-    },
   });
   stitcher.applyDesired(desiredDoc());
-  return { clock, net, stitcher, aOpts, bOpts, changes: () => selectionChanges };
+  return { clock, net, stitcher, aOpts, bOpts };
 }
 
 describe('master playlist rewriting', () => {
@@ -144,10 +139,9 @@ describe('virtual MEDIA-SEQUENCE', () => {
     expect(seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'))).toBeGreaterThanOrEqual(v2);
   });
 
-  it('stays monotonic across a switcher restart (new instance, later wall clock)', async () => {
+  it('a fresh replica boots into the doc-selected upstream with a fresh time-derived base', async () => {
     const { stitcher, clock, net } = setup();
     const v1 = seqOf(await stitcher.getMediaPlaylist('ch1', '1080p'));
-    const selections: SelectionMap = stitcher.getSelections();
 
     clock.nowMs += 30_000;
     const stitcher2 = new Stitcher({
@@ -156,22 +150,23 @@ describe('virtual MEDIA-SEQUENCE', () => {
       fetchImpl: net.fetchImpl,
       now: () => clock.nowMs,
     });
-    stitcher2.applyDesired(desiredDoc(), selections);
+    const doc = desiredDoc();
+    doc.channels[0]!.activeUpstreamId = 'p-a'; // the upstream the previous instance was serving
+    stitcher2.applyDesired(doc);
     const v2 = seqOf(await stitcher2.getMediaPlaylist('ch1', '1080p'));
     expect(v2).toBeGreaterThan(v1);
     expect(v2).toBe(timeBase(clock.nowMs)); // fresh time-derived base
   });
 
-  it('restores the persisted selection on restart', async () => {
-    const { stitcher, clock, net } = setup();
-    stitcher.switchTo('ch1', 'p-b', 'manual');
-    const selections = stitcher.getSelections();
-
+  it('a fresh replica boots directly into the doc-pushed active upstream', async () => {
+    const { clock, net } = setup();
+    const doc = desiredDoc();
+    doc.channels[0]!.activeUpstreamId = 'p-b';
     const stitcher2 = new Stitcher({ cacheTtlMs: 2000, stallGraceSec: 10, fetchImpl: net.fetchImpl, now: () => clock.nowMs });
-    stitcher2.applyDesired(desiredDoc(), selections);
+    stitcher2.applyDesired(doc);
     const status = stitcher2.channelStatuses()[0]!;
     expect(status.activeUpstreamId).toBe('p-b');
-    expect(status.lastSwitch).toMatchObject({ to: 'p-b', reason: 'manual', from: null });
+    expect(status.lastSwitch).toBeNull(); // initial pick from the doc, not a switch
     const text = await stitcher2.getMediaPlaylist('ch1', '1080p');
     expect(segmentUrisOf(text)[0]).toContain(segPrefix(NODE_B));
   });
@@ -318,25 +313,21 @@ describe('served-window retention', () => {
     expect(segmentUrisOf(text).at(-1)).toContain(segPrefix(NODE_C));
   });
 
-  it('rebuilds from the active upstream after a restart mid-drain', async () => {
-    const { stitcher, clock, net } = setup();
-    await stitcher.getMediaPlaylist('ch1', '1080p');
-    stitcher.switchTo('ch1', 'p-b', 'manual');
-    clock.nowMs = T0 + 7000;
-    await stitcher.getMediaPlaylist('ch1', '1080p'); // mid-drain: 5 p-a + 1 p-b
-    const selections = stitcher.getSelections();
-
-    // "restart": fresh instance, in-memory buffer lost
+  it('a fresh replica renders a clean window from the doc-pushed upstream, with no carried-over discontinuity', async () => {
+    const { clock, net } = setup();
     clock.nowMs = T0 + 12_000;
+    const doc = desiredDoc();
+    doc.channels[0]!.activeUpstreamId = 'p-b';
     const stitcher2 = new Stitcher({
       cacheTtlMs: 2000,
       stallGraceSec: 10,
       fetchImpl: net.fetchImpl,
       now: () => clock.nowMs,
     });
-    stitcher2.applyDesired(desiredDoc(), selections);
+    stitcher2.applyDesired(doc);
     const text = await stitcher2.getMediaPlaylist('ch1', '1080p');
-    // clean re-window from the active upstream — monotonic, no spurious boundary
+    // no in-memory buffer to carry a splice boundary forward from — a fresh
+    // instance's first render of an upstream is never flagged as a switch
     expect(segmentUrisOf(text).every((u) => u.startsWith(segPrefix(NODE_B)))).toBe(true);
     expect(seqOf(text)).toBe(timeBase(clock.nowMs));
     expect(discCount(text)).toBe(0);
@@ -368,9 +359,8 @@ describe('PDT-aligned splice', () => {
 
 describe('health probing (no autonomous failover)', () => {
   it('marks the active upstream unhealthy and throws — never switches — when its fetch fails with a healthy candidate available', async () => {
-    const { stitcher, net, changes } = setup();
+    const { stitcher, net } = setup();
     net.routes[`${NODE_A}/1080p/stream.m3u8`] = () => ({ status: 500 });
-    const before = changes();
     const err = await stitcher.getMediaPlaylist('ch1', '1080p').then(
       () => null,
       (e: unknown) => e,
@@ -380,7 +370,6 @@ describe('health probing (no autonomous failover)', () => {
     expect(status.activeUpstreamId).toBe('p-a'); // p-b is healthy, but switching is the controller's job
     expect(status.lastSwitch).toBeNull();
     expect(status.upstreams.find((u) => u.id === 'p-a')?.healthy).toBe(false);
-    expect(changes()).toBe(before); // no selection change persisted
   });
 
   it('keeps serving a stale playlist and marks it unhealthy without switching (healthy candidate available)', async () => {
@@ -480,7 +469,6 @@ describe('applyDesired', () => {
     const status = stitcher.channelStatuses()[0]!;
     expect(status.activeUpstreamId).toBe('p-a');
     expect(status.lastSwitch).toMatchObject({ from: 'p-b', to: 'p-a', reason: 'push' });
-    expect(stitcher.getSelections()['ch1']).toMatchObject({ upstreamId: 'p-a', reason: 'push' });
   });
 
   it('new channels pick the priority-1 upstream regardless of array order; removed channels are dropped', () => {
@@ -502,7 +490,61 @@ describe('applyDesired', () => {
     expect(statuses[0]!.slug).toBe('ch2');
     expect(statuses[0]!.activeUpstreamId).toBe('q-top');
     expect(statuses[0]!.lastSwitch).toBeNull(); // initial pick, not a switch
-    expect(stitcher.getSelections()['ch1']).toBeUndefined(); // pruned
+  });
+
+  it('activeUpstreamId in the doc drives a real switch (reason push) with splice/discontinuity mechanics', async () => {
+    const { stitcher, clock } = setup();
+    await stitcher.getMediaPlaylist('ch1', '1080p'); // p-a served, splice cutoff established
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.activeUpstreamId = 'p-b';
+    stitcher.applyDesired(doc);
+    const status = stitcher.channelStatuses()[0]!;
+    expect(status.activeUpstreamId).toBe('p-b');
+    expect(status.lastSwitch).toMatchObject({ from: 'p-a', to: 'p-b', reason: 'push' });
+
+    clock.nowMs = T0 + 7000;
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(countFor(text, NODE_A)).toBeGreaterThan(0); // outgoing tail retained
+    expect(discCount(text)).toBe(1); // splice discontinuity inserted
+  });
+
+  it('falls through to keep-current when activeUpstreamId names a nonexistent upstream', () => {
+    const { stitcher } = setup();
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.activeUpstreamId = 'p-zzz';
+    stitcher.applyDesired(doc);
+    const status = stitcher.channelStatuses()[0]!;
+    expect(status.activeUpstreamId).toBe('p-b'); // kept, the dangling reference is ignored
+    expect(status.lastSwitch?.reason).toBe('manual'); // no new switch recorded
+  });
+
+  it('is a no-op when the doc names the already-active upstream', () => {
+    const { stitcher } = setup();
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    const lastSwitchBefore = stitcher.channelStatuses()[0]!.lastSwitch;
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.activeUpstreamId = 'p-b';
+    stitcher.applyDesired(doc);
+    const status = stitcher.channelStatuses()[0]!;
+    expect(status.activeUpstreamId).toBe('p-b');
+    expect(status.lastSwitch).toEqual(lastSwitchBefore); // unchanged, no new switch recorded
+  });
+});
+
+describe('onDemandIdle channels', () => {
+  it('probeAll and the eager push probe both skip channels flagged onDemandIdle', async () => {
+    const { stitcher, net } = setup();
+    await new Promise((resolve) => setImmediate(resolve)); // settle the eager setup probe
+    net.calls.length = 0;
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.onDemandIdle = true;
+    stitcher.applyDesired(doc); // triggers the eager probeNeverChecked() internally
+    await new Promise((resolve) => setImmediate(resolve)); // flush any fire-and-forget probe
+    expect(net.calls).toHaveLength(0); // no eager probe for an idle channel
+
+    await stitcher.probeAll();
+    expect(net.calls).toHaveLength(0); // still no probe traffic
   });
 });
 

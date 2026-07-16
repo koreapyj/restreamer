@@ -23,8 +23,9 @@ import { Value } from '@sinclair/typebox/value';
 import { parse } from 'yaml';
 
 /**
- * Switcher configuration. Same conventions as the daemon's config.ts: every
- * key optional, an empty file yields pure defaults.
+ * Switcher configuration. Same conventions as the daemon's config.ts for
+ * every other key: optional, defaulted. `controllerUrl` is the one required
+ * key — an empty file is not valid.
  */
 export const SwitcherConfigSchema = Type.Object({
   listen: Type.Object(
@@ -34,8 +35,8 @@ export const SwitcherConfigSchema = Type.Object({
     },
     { default: {} },
   ),
-  /** atomic JSON persistence of the desired doc + active-selection map (one file, see desiredStore.ts) */
-  stateFile: Type.String({ default: '/var/lib/switcher/desired.json' }),
+  /** the controller's WS endpoint this switcher dials, e.g. ws://controller:8080/ws/switcher — see controllerLink.ts */
+  controllerUrl: Type.String({ minLength: 1 }),
   /** per-(slug,variant,upstream) micro-cache of upstream playlist fetches */
   cacheTtlMs: Type.Number({ minimum: 0, default: 2000 }),
   /** background health probe period for ALL upstreams of ALL channels (keeps health fresh for unwatched channels) */

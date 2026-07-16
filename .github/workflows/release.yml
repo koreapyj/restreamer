@@ -198,17 +198,17 @@ jobs:
       - name: Smoke-test image on the runner
         run: |
           set -euxo pipefail
-          mkdir -p /tmp/switcher-smoke/state
-          # the image runs as USER node (uid 1000)
-          chmod 777 /tmp/switcher-smoke/state
+          mkdir -p /tmp/switcher-smoke
+          # no controller runs here: the link retries with backoff while
+          # healthz (liveness) stays up — exactly the k8s controller-down shape
           cat > /tmp/switcher-smoke/switcher.yaml <<'EOF'
           listen:
             host: 0.0.0.0
             port: 5590
+          controllerUrl: ws://127.0.0.1:1/ws/switcher
           EOF
           docker run -d --name switcher-smoke -p 127.0.0.1:5590:5590 \
             -v /tmp/switcher-smoke/switcher.yaml:/etc/restreamer/switcher.yaml:ro \
-            -v /tmp/switcher-smoke/state:/var/lib/switcher \
             restreamer-switcher:smoke
 
           ok=0

@@ -45,7 +45,8 @@ export const RESTREAMER_API_VERSION = 1;
  */
 export const SESSION_NAME_PATTERN = '^[a-z0-9][a-z0-9-]{0,63}$';
 
-const SessionName = Type.String({ pattern: SESSION_NAME_PATTERN });
+export const SessionName = Type.String({ pattern: SESSION_NAME_PATTERN });
+export type SessionName = Static<typeof SessionName>;
 
 // ---------------------------------------------------------------------------
 // Desired state (controller → daemon, PUT /v1/desired)
@@ -344,6 +345,19 @@ export const SwitcherChannel = Type.Object({
   /** hls_time of the upstream encodes — drives the stall threshold and virtual MEDIA-SEQUENCE derivation */
   segmentSeconds: Type.Number(),
   upstreams: Type.Array(SwitcherUpstream, { minItems: 1 }),
+  /**
+   * The controller-intended active upstream (a placement id from
+   * `upstreams`); the switcher applies it as a real switch when it differs
+   * from its current selection. Optional only for schema additivity — the
+   * controller always sets it.
+   */
+  activeUpstreamId: Type.Optional(Type.String()),
+  /**
+   * true = an on-demand channel whose encode is currently down; the switcher
+   * must not health-probe its upstreams (they are expected dead) and
+   * playlist fetches will 503 until the controller wakes the encode.
+   */
+  onDemandIdle: Type.Optional(Type.Boolean()),
 });
 export type SwitcherChannel = Static<typeof SwitcherChannel>;
 

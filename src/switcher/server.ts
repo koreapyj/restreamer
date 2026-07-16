@@ -17,45 +17,33 @@
  */
 
 /*
- * Switcher HTTP surface: the /v1 control API (contract/v1.ts, unauthenticated
- * by contract — never expose it publicly, see deploy/k8s/switcher.yaml) and
- * the viewer-facing /hls virtual-playlist routes.
+ * Switcher HTTP surface: the read-only /v1 health/status API (contract/v1.ts,
+ * unauthenticated by contract — never expose it publicly, see
+ * deploy/k8s/switcher.yaml) and the viewer-facing /hls virtual-playlist
+ * routes. Desired-doc pushes and manual switches arrive over the WebSocket
+ * link (controllerLink.ts, contract/ws1.ts) instead of this HTTP surface.
  */
 
 import fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
-import type { TSchema } from '@sinclair/typebox';
-import { Value } from '@sinclair/typebox/value';
-import {
-  SwitchCommand,
-  SwitcherDesiredState,
-  type SwitcherStatus,
-} from '../contract/v1.js';
-import type { SwitcherStore } from './desiredStore.js';
+import type { SwitcherStatus } from '../contract/v1.js';
+import type { ControllerLink } from './controllerLink.js';
 import {
   type Logger,
   type Stitcher,
   UnknownChannelError,
-  UnknownUpstreamError,
   UnknownVariantError,
   UpstreamUnavailableError,
 } from './stitch.js';
 
 export interface SwitcherServerOptions {
   stitcher: Stitcher;
-  store: SwitcherStore;
+  link: Pick<ControllerLink, 'connected' | 'docReceived' | 'noteDemand'>;
   version: string;
   logger?: Logger;
   nowMs?: () => number;
 }
 
 const HLS_CONTENT_TYPE = 'application/vnd.apple.mpegurl';
-
-function schemaErrors(schema: TSchema, value: unknown): string {
-  return [...Value.Errors(schema, value)]
-    .slice(0, 10)
-    .map((e) => `${e.path || '/'}: ${e.message}`)
-    .join('; ');
-}
 
 function sendHlsError(reply: FastifyReply, err: unknown): FastifyReply {
   if (err instanceof UnknownChannelError || err instanceof UnknownVariantError) {
@@ -68,15 +56,11 @@ function sendHlsError(reply: FastifyReply, err: unknown): FastifyReply {
 }
 
 export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
-  const { stitcher, store } = opts;
+  const { stitcher, link } = opts;
   const nowMs = opts.nowMs ?? Date.now;
   const startedAtMs = nowMs();
   const startedAt = new Date(startedAtMs).toISOString();
   const app = fastify({ logger: false });
-
-  const persist = async (): Promise<void> => {
-    await store.save(stitcher.getDesired(), stitcher.getSelections());
-  };
 
   // Browsers play the switcher's playlists cross-origin, and virtual
   // playlists must never be cached — a stale one desyncs the virtual
@@ -100,58 +84,16 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
     channels: stitcher.channelStatuses(),
   }));
 
-  app.get('/v1/desired', async (_req, reply) => {
-    const doc = stitcher.getDesired();
-    if (!doc) return reply.code(404).send({ error: 'no desired state has been pushed yet' });
-    return doc;
-  });
-
-  // Full replacement, all-or-nothing: the whole doc must pass the schema plus
-  // uniqueness checks before anything is applied or persisted.
-  app.put('/v1/desired', async (req, reply) => {
-    const body: unknown = req.body;
-    if (!Value.Check(SwitcherDesiredState, body)) {
-      return reply.code(400).send({ error: `invalid desired state: ${schemaErrors(SwitcherDesiredState, body)}` });
-    }
-    const slugs = new Set<string>();
-    for (const channel of body.channels) {
-      if (slugs.has(channel.slug)) {
-        return reply.code(400).send({ error: `invalid desired state: duplicate channel slug ${channel.slug}` });
-      }
-      slugs.add(channel.slug);
-      const ids = new Set<string>();
-      for (const up of channel.upstreams) {
-        if (ids.has(up.id)) {
-          return reply
-            .code(400)
-            .send({ error: `invalid desired state: duplicate upstream id ${up.id} in channel ${channel.slug}` });
-        }
-        ids.add(up.id);
-      }
-    }
-    stitcher.applyDesired(body);
-    await persist();
-    return reply.code(204).send();
-  });
-
-  app.post<{ Params: { slug: string } }>('/v1/channels/:slug/switch', async (req, reply) => {
-    const body: unknown = req.body;
-    if (!Value.Check(SwitchCommand, body)) {
-      return reply.code(400).send({ error: `invalid switch command: ${schemaErrors(SwitchCommand, body)}` });
-    }
-    try {
-      stitcher.switchTo(req.params.slug, body.upstreamId, 'manual');
-    } catch (err) {
-      if (err instanceof UnknownChannelError || err instanceof UnknownUpstreamError) {
-        return reply.code(404).send({ error: err.message });
-      }
-      throw err;
-    }
-    await persist();
-    return stitcher.channelStatuses().find((c) => c.slug === req.params.slug);
+  // Readiness gates on having applied a doc, NOT on the live connection: a
+  // replica holding a doc keeps serving through a controller outage or
+  // restart, but a fresh pod without one must never receive traffic.
+  app.get('/v1/readyz', async (_req, reply) => {
+    if (link.docReceived) return { ok: true };
+    return reply.code(503).send({ ok: false, connected: link.connected, docReceived: false });
   });
 
   app.get<{ Params: { slug: string } }>('/hls/:slug/playlist.m3u8', async (req, reply) => {
+    link.noteDemand(req.params.slug, 'master');
     try {
       const text = await stitcher.getMasterPlaylist(req.params.slug);
       return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
@@ -163,6 +105,7 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
   app.get<{ Params: { slug: string; variant: string } }>(
     '/hls/:slug/:variant/stream.m3u8',
     async (req, reply) => {
+      link.noteDemand(req.params.slug, 'media');
       try {
         const text = await stitcher.getMediaPlaylist(req.params.slug, req.params.variant);
         return reply.header('content-type', HLS_CONTENT_TYPE).send(text);

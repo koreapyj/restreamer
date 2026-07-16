@@ -186,17 +186,21 @@ Deploy runbook:
 1. Edit `deploy/k8s/switcher.yaml`: the Deployment `image:` (your GHCR owner
    + a released version), the Ingress `host:` (must equal this switcher's
    `publicUrl` in tvh-controller's `restreamer.switchers` block), and the
-   ConfigMap if you need non-default config. If the GHCR package stays
-   private (the default), add the `imagePullSecrets` — see the comment in
-   the manifest.
+   ConfigMap's `controllerUrl` (the controller's in-cluster WS endpoint this
+   switcher dials out to, e.g. `ws://tvh-controller.<namespace>.svc:<port>/ws/switcher`)
+   plus any other non-default config. If the GHCR package stays private (the
+   default), add the `imagePullSecrets` — see the comment in the manifest.
 2. `kubectl apply -f deploy/k8s/switcher.yaml`
 3. Verify: `kubectl port-forward svc/restreamer-switcher 8080:80`, then
-   `curl -fsS http://127.0.0.1:8080/v1/healthz`.
-4. Point tvh-controller at it: a `restreamer.switchers` entry whose `url` is
-   the in-cluster Service URL (`http://restreamer-switcher.<namespace>.svc`)
-   and whose `publicUrl` is the Ingress host. The controller pushes the
-   desired doc from there; only `/hls` may be exposed publicly (the `/v1`
-   API is unauthenticated by contract — see the manifest's SECURITY note).
+   `curl -fsS http://127.0.0.1:8080/v1/healthz` and
+   `curl -fsS http://127.0.0.1:8080/v1/readyz` (503 until the switcher has
+   received a doc over its WS link to the controller).
+4. Point tvh-controller at it: a `restreamer.switchers` entry whose
+   `publicUrl` is the Ingress host, used only for the M3U entries redundant
+   channels generate. The switcher dials the controller itself via
+   `controllerUrl` — nothing needs to dial the switcher; only `/hls` may be
+   exposed publicly (the `/v1` API is unauthenticated by contract — see the
+   manifest's SECURITY note).
 
 ## Migration from the per-channel systemd units
 

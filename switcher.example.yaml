@@ -1,7 +1,8 @@
 # switcher configuration
 #
 # Lookup order: $SWITCHER_CONFIG -> ./switcher.yaml -> /etc/restreamer/switcher.yaml
-# Every key is optional; an empty file yields the defaults shown below.
+# Every key is optional except controllerUrl; the rest yield the defaults
+# shown below.
 
 # HTTP bind address. /v1 is unauthenticated by contract — expose only /hls
 # publicly (see deploy/k8s/switcher.yaml).
@@ -9,9 +10,10 @@ listen:
   host: 0.0.0.0
   port: 5590
 
-# Persisted desired doc + active-selection map (one atomic JSON file; on
-# Kubernetes this path is PVC-backed so restarts keep serving state).
-stateFile: /var/lib/switcher/desired.json
+# The controller's WS endpoint this switcher dials and keeps a persistent
+# connection to — desired-doc pushes and manual switches arrive on it, and it
+# carries status/demand back. Required, no default.
+controllerUrl: ws://controller:8080/ws/switcher
 
 # Upstream playlist fetches are micro-cached per (channel, variant, upstream)
 # for this long — load scales with actual viewers, not request rate.

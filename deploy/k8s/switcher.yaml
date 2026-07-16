@@ -1,12 +1,14 @@
 # Switcher deployment — HLS failover/splice service (see src/switcher/).
 #
-# Singleton by design: the active-selection state is per-process, so keep
-# replicas at 1 with strategy Recreate (also required by the RWO PVC);
-# Kubernetes rescheduling is the standby story. If the PVC is ever lost the
-# switcher boots empty and reports desiredRevision: null — the controller's
-# status poll re-pushes immediately.
+# Stateless replicas: each pod dials the controller over a persistent
+# WebSocket (controllerLink.ts) and serves from the last doc it received in
+# memory — there is no PVC and nothing to reconcile between pods. Scale
+# `replicas` freely. A pod that hasn't received a doc yet fails readiness
+# (`/v1/readyz`) and gets no traffic; one that has keeps serving through
+# controller outages and rolling restarts alike, which is what makes
+# maxUnavailable: 0 safe below.
 #
-# SECURITY: the /v1 control API is unauthenticated by contract. Only the
+# SECURITY: the /v1 API is unauthenticated by contract. Only the
 # viewer-facing /hls path may be exposed through the Ingress; /v1 must stay
 # cluster-internal (and ideally be limited to the controller with a
 # NetworkPolicy, as for tvh-controller).
@@ -21,31 +23,22 @@ data:
     listen:
       host: 0.0.0.0
       port: 5590
-    stateFile: /var/lib/switcher/desired.json
+    controllerUrl: ws://tvh-controller.CHANGEME.svc:PORT/ws/switcher
     cacheTtlMs: 2000
     probeIntervalMs: 15000
     stallGraceSec: 10
----
-# Desired doc + active-selection map survive pod restarts/rescheduling here.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: switcher-state
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 1Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: restreamer-switcher
 spec:
-  replicas: 1
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: restreamer-switcher
@@ -54,9 +47,6 @@ spec:
       labels:
         app: restreamer-switcher
     spec:
-      # the image runs as USER node (uid 1000); make the PVC writable for it
-      securityContext:
-        fsGroup: 1000
       # GHCR packages are PRIVATE by default. Either make the package public
       # (GitHub -> Packages -> restreamer-switcher -> package settings), or
       # create a pull secret and uncomment imagePullSecrets:
@@ -80,20 +70,15 @@ spec:
             - name: config
               mountPath: /etc/restreamer
               readOnly: true
-            - name: state
-              mountPath: /var/lib/switcher
           livenessProbe:
             httpGet: { path: /v1/healthz, port: 5590 }
             initialDelaySeconds: 5
           readinessProbe:
-            httpGet: { path: /v1/healthz, port: 5590 }
+            httpGet: { path: /v1/readyz, port: 5590 }
       volumes:
         - name: config
           configMap:
             name: switcher-config
-        - name: state
-          persistentVolumeClaim:
-            claimName: switcher-state
 ---
 apiVersion: v1
 kind: Service
@@ -114,8 +99,13 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: restreamer-switcher
-  # annotations:
-  #   cert-manager.io/cluster-issuer: letsencrypt
+  annotations:
+    # each replica keeps its own served-window buffer per channel/variant, so
+    # pin every request for a given playlist path to the same replica — a
+    # re-hash on pod add/remove is a restart-equivalent virtual-sequence jump,
+    # which players already tolerate.
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"
+    # cert-manager.io/cluster-issuer: letsencrypt
 spec:
   rules:
     - host: switcher.example.com # placeholder — set to the switcher publicUrl host

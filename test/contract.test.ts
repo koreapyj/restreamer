@@ -13,11 +13,20 @@ import {
   SourcesResponse,
   StatusResponse,
   SwitchCommand,
+  SwitcherChannel,
   SwitcherDesiredState,
   type DesiredState as DesiredStateT,
   type StatusResponse as StatusResponseT,
   type SwitcherDesiredState as SwitcherDesiredStateT,
 } from '../src/contract/v1.js';
+import {
+  WsDemand,
+  WsDoc,
+  WsHelloDown,
+  WsHelloUp,
+  WsStatus,
+  WsSwitch,
+} from '../src/contract/ws1.js';
 
 /** mirrors a production at-x unit: SOURCE=channel, PID=333, controller-rendered argv */
 function atXDoc(): DesiredStateT {
@@ -312,5 +321,92 @@ describe('SwitcherDesiredState', () => {
     expect(Value.Check(SwitchCommand, { upstreamId: 'placement-2' })).toBe(true);
     expect(Value.Check(SwitchCommand, { upstreamId: '' })).toBe(false);
     expect(Value.Check(SwitchCommand, {})).toBe(false);
+  });
+});
+
+describe('SwitcherChannel activeUpstreamId / onDemandIdle', () => {
+  function channel(): SwitcherDesiredStateT['channels'][number] {
+    return {
+      slug: 'at-x',
+      segmentSeconds: 5,
+      upstreams: [{ id: 'placement-1', url: 'http://node-a.local/at-x', priority: 0 }],
+    };
+  }
+
+  it('accepts a channel with both fields present', () => {
+    expect(
+      Value.Check(SwitcherChannel, { ...channel(), activeUpstreamId: 'placement-1', onDemandIdle: true }),
+    ).toBe(true);
+  });
+
+  it('accepts a channel with both fields absent', () => {
+    expect(Value.Check(SwitcherChannel, channel())).toBe(true);
+  });
+});
+
+describe('ws1 wire messages', () => {
+  it('validates WsHelloDown', () => {
+    expect(Value.Check(WsHelloDown, { v: 1, type: 'hello', serverVersion: '1.2.3' })).toBe(true);
+    expect(Value.Check(WsHelloDown, { v: 1, type: 'status', serverVersion: '1.2.3' })).toBe(false);
+  });
+
+  it('validates WsDoc', () => {
+    const doc: SwitcherDesiredStateT = {
+      apiVersion: 1,
+      revision: 'r42',
+      channels: [
+        {
+          slug: 'at-x',
+          segmentSeconds: 5,
+          upstreams: [{ id: 'placement-1', url: 'http://node-a.local/at-x', priority: 0 }],
+        },
+      ],
+    };
+    expect(Value.Check(WsDoc, { v: 1, type: 'doc', doc })).toBe(true);
+    expect(Value.Check(WsDoc, { v: 1, type: 'doc' })).toBe(false);
+  });
+
+  it('validates WsSwitch', () => {
+    expect(Value.Check(WsSwitch, { v: 1, type: 'switch', slug: 'at-x', upstreamId: 'placement-2' })).toBe(
+      true,
+    );
+    expect(Value.Check(WsSwitch, { v: 1, type: 'switch', slug: 'at-x' })).toBe(false);
+  });
+
+  it('validates WsHelloUp', () => {
+    expect(
+      Value.Check(WsHelloUp, {
+        v: 1,
+        type: 'hello',
+        switcherVersion: '1.2.3',
+        startedAt: '2026-07-06T00:00:00.000Z',
+      }),
+    ).toBe(true);
+    expect(Value.Check(WsHelloUp, { v: 1, type: 'hello', switcherVersion: '1.2.3' })).toBe(false);
+  });
+
+  it('validates WsStatus', () => {
+    expect(Value.Check(WsStatus, { v: 1, type: 'status', desiredRevision: 'r42', channels: [] })).toBe(
+      true,
+    );
+    expect(Value.Check(WsStatus, { v: 1, type: 'status', desiredRevision: null, channels: [] })).toBe(true);
+    expect(Value.Check(WsStatus, { v: 1, type: 'status', channels: [] })).toBe(false);
+  });
+
+  it('validates WsDemand', () => {
+    expect(
+      Value.Check(WsDemand, {
+        v: 1,
+        type: 'demand',
+        events: [{ slug: 'at-x', kind: 'master', at: '2026-07-06T00:00:00.000Z' }],
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(WsDemand, {
+        v: 1,
+        type: 'demand',
+        events: [{ slug: 'at-x', kind: 'bogus', at: '2026-07-06T00:00:00.000Z' }],
+      }),
+    ).toBe(false);
   });
 });

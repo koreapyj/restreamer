@@ -81,21 +81,34 @@
  * on-demand fetch of the ACTIVE upstream; probeAll() (driven by a timer in
  * main.ts) checks every upstream of every channel so status stays fresh, and
  * applyDesired() eagerly probes never-checked upstreams so a just-pushed
- * upstream gets a health+lag reading quickly.
+ * upstream gets a health+lag reading quickly. A channel flagged
+ * onDemandIdle (its encode is intentionally down) is skipped by both — see
+ * "On-demand idle channels" below.
  *
  * The switcher NEVER switches on its own health judgment: the controller is
- * the sole failover authority and drives every switch through
- * POST /v1/channels/:slug/switch (switchTo). The only doc-driven exception is
- * applyDesired()'s 'push' re-pick when the active upstream disappears from a
- * controller-authored doc — leaving activeUpstreamId dangling would break
- * segment resolution, so a deterministic pick from the new doc is the only
- * sound behavior. When the active upstream is unhealthy the channel stays
- * put — a stale-but-fetchable playlist is still served, a failed fetch
- * surfaces as UpstreamUnavailableError (HTTP 503 upstairs) until the
- * controller orders a switch.
+ * the sole failover authority and drives every switch either with a WS
+ * 'switch' frame or by naming the intended upstream in a pushed doc's
+ * channel.activeUpstreamId — both go through doSwitch, so the splice point
+ * and discontinuity bookkeeping are identical either way. When a doc omits
+ * activeUpstreamId the current selection is kept if its upstream survived,
+ * or re-picked deterministically if it didn't (leaving activeUpstreamId
+ * dangling would break segment resolution). When the active upstream is
+ * unhealthy the channel stays put — a stale-but-fetchable playlist is still
+ * served, a failed fetch surfaces as UpstreamUnavailableError (HTTP 503
+ * upstairs) until the controller orders a switch.
  *
- * Pure-ish: fetch and clock are injected; no filesystem access (persistence
- * is the caller's job via onSelectionsChanged / getSelections()).
+ * ── On-demand idle channels ──────────────────────────────────────────────
+ *
+ * A channel's `onDemandIdle` flag means its encode is intentionally not
+ * running (nothing is watching it right now) — its upstreams are expected
+ * to be unreachable, so health probing is skipped rather than logging churn
+ * for a down encode nobody asked to bring up. The switcher never decides
+ * this itself: it only reflects `SwitcherChannel.onDemandIdle` from the
+ * pushed doc.
+ *
+ * Pure-ish: fetch and clock are injected; no filesystem access and no
+ * persistence — a fresh instance derives its active selection entirely from
+ * the pushed doc's `activeUpstreamId` (see applyDesired).
  */
 
 import type {
@@ -111,14 +124,6 @@ export interface Logger {
   warn(msg: string): void;
   error(msg: string): void;
 }
-
-export interface SwitchSelection {
-  upstreamId: string;
-  /** ISO 8601 */
-  switchedAt: string;
-  reason: SwitchReason;
-}
-export type SelectionMap = Record<string, SwitchSelection>;
 
 export class UnknownChannelError extends Error {}
 export class UnknownVariantError extends Error {}
@@ -333,6 +338,8 @@ interface ChannelState {
   knownVariants: Set<string>;
   health: Map<string, UpstreamHealth>;
   variants: Map<string, VariantState>;
+  /** mirrors SwitcherChannel.onDemandIdle, refreshed on every applyDesired — see the module header */
+  onDemandIdle: boolean;
 }
 
 interface CacheEntry {
@@ -350,8 +357,6 @@ export interface StitcherOptions {
   /** injectable clock (ms since epoch) */
   now?: () => number;
   logger?: Logger;
-  /** persistence hook — fired after any change to the active-selection map */
-  onSelectionsChanged?: () => void;
 }
 
 const NULL_LOGGER: Logger = { info: () => {}, warn: () => {}, error: () => {} };
@@ -362,10 +367,8 @@ export class Stitcher {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => number;
   private readonly logger: Logger;
-  private readonly onSelectionsChanged: () => void;
 
   private channels = new Map<string, ChannelState>();
-  private selections: SelectionMap = {};
   private desired: SwitcherDesiredState | null = null;
   private cache = new Map<string, CacheEntry>();
 
@@ -375,7 +378,6 @@ export class Stitcher {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.logger = opts.logger ?? NULL_LOGGER;
-    this.onSelectionsChanged = opts.onSelectionsChanged ?? (() => {});
   }
 
   get desiredRevision(): string | null {
@@ -386,27 +388,24 @@ export class Stitcher {
     return this.desired;
   }
 
-  getSelections(): SelectionMap {
-    return { ...this.selections };
-  }
-
   // -------------------------------------------------------------------------
   // Desired state
   // -------------------------------------------------------------------------
 
   /**
-   * Full replace. Selection policy:
-   *   - `initialSelections` (restart restore) wins when its upstream still
-   *     exists for the slug;
-   *   - else the current in-memory selection is kept if its upstream survived;
-   *   - else (selection's upstream removed) the highest-priority healthy
-   *     upstream — or the highest-priority one — is picked, reason 'push';
-   *   - brand-new channels pick the priority-1 (lowest number) upstream;
-   *   - removed channels are dropped, selections pruned.
+   * Full replace. Selection policy per channel:
+   *   - `channel.activeUpstreamId`, when present and naming a surviving
+   *     upstream, wins: a real switch (doSwitch, reason 'push') when it
+   *     differs from the current active upstream, else a plain initial pick;
+   *   - otherwise the current in-memory active upstream is kept if it
+   *     survived;
+   *   - else (no prior selection, or its upstream was removed) the
+   *     highest-priority healthy upstream — or the highest-priority one — is
+   *     picked, reason 'push';
+   *   - removed channels are dropped.
    */
-  applyDesired(doc: SwitcherDesiredState, initialSelections?: SelectionMap): void {
+  applyDesired(doc: SwitcherDesiredState): void {
     const next = new Map<string, ChannelState>();
-    const nextSelections: SelectionMap = {};
 
     for (const channel of doc.channels) {
       const prev = this.channels.get(channel.slug);
@@ -419,8 +418,10 @@ export class Stitcher {
         knownVariants: new Set(),
         health: new Map(),
         variants: new Map(),
+        onDemandIdle: false,
       };
       st.channel = channel;
+      st.onDemandIdle = channel.onDemandIdle ?? false;
 
       const ids = new Set(channel.upstreams.map((u) => u.id));
       const health = new Map<string, UpstreamHealth>();
@@ -429,21 +430,22 @@ export class Stitcher {
       }
       st.health = health;
 
-      const restored = initialSelections?.[channel.slug];
-      if (restored && ids.has(restored.upstreamId)) {
-        st.activeUpstreamId = restored.upstreamId;
-        // reconstruct lastSwitch from the persisted selection (from is unknown across restarts)
-        st.lastSwitch = { at: restored.switchedAt, from: null, to: restored.upstreamId, reason: restored.reason };
-        nextSelections[channel.slug] = restored;
-      } else if (st.activeUpstreamId !== null && ids.has(st.activeUpstreamId)) {
-        // active upstream survived the push — keep serving it untouched
-        const kept = this.selections[channel.slug];
-        nextSelections[channel.slug] = kept ?? {
-          upstreamId: st.activeUpstreamId,
-          switchedAt: new Date(this.now()).toISOString(),
-          reason: 'push',
-        };
-      } else {
+      const pushed =
+        channel.activeUpstreamId !== undefined && ids.has(channel.activeUpstreamId)
+          ? channel.activeUpstreamId
+          : undefined;
+
+      if (pushed !== undefined) {
+        // the doc names the intended active upstream explicitly — the same
+        // real switch as a WS 'switch' frame, or a plain initial pick when
+        // nothing was active yet
+        if (st.activeUpstreamId !== null && st.activeUpstreamId !== pushed) {
+          this.doSwitch(st, pushed, 'push');
+        } else {
+          st.activeUpstreamId = pushed;
+        }
+      } else if (st.activeUpstreamId === null || !ids.has(st.activeUpstreamId)) {
+        // no prior selection, or its upstream was removed — pick anew
         const sorted = [...channel.upstreams].sort((a, b) => a.priority - b.priority);
         const healthyFirst = sorted.find((u) => st.health.get(u.id)?.healthy !== false) ?? sorted[0];
         if (!healthyFirst) continue; // unreachable: upstreams has minItems 1
@@ -458,20 +460,14 @@ export class Stitcher {
           st.spliceFromPdtMs = st.lastServedPdtEndMs;
         }
         st.activeUpstreamId = healthyFirst.id;
-        nextSelections[channel.slug] = {
-          upstreamId: healthyFirst.id,
-          switchedAt: new Date(this.now()).toISOString(),
-          reason: 'push',
-        };
       }
+      // else: active upstream survived the push — keep serving it untouched
       next.set(channel.slug, st);
     }
 
     this.channels = next;
-    this.selections = nextSelections;
     this.desired = doc;
     this.cache.clear();
-    this.onSelectionsChanged();
     this.probeNeverChecked();
   }
 
@@ -496,9 +492,7 @@ export class Stitcher {
     ch.lastSwitch = { at, from, to: toId, reason };
     // PDT-aligned splice point: everything served so far ends here
     ch.spliceFromPdtMs = ch.lastServedPdtEndMs;
-    this.selections[ch.channel.slug] = { upstreamId: toId, switchedAt: at, reason };
     this.logger.info(`channel ${ch.channel.slug}: switched ${from ?? '(none)'} → ${toId} (${reason})`);
-    this.onSelectionsChanged();
   }
 
   // -------------------------------------------------------------------------
@@ -664,6 +658,7 @@ export class Stitcher {
    */
   async probeAll(): Promise<void> {
     for (const ch of this.channels.values()) {
+      if (ch.onDemandIdle) continue; // encode is intentionally down — see the module header
       await Promise.all(ch.channel.upstreams.map((up) => this.probeUpstream(ch, up)));
     }
   }
@@ -677,6 +672,7 @@ export class Stitcher {
    */
   private probeNeverChecked(): void {
     for (const ch of this.channels.values()) {
+      if (ch.onDemandIdle) continue; // encode is intentionally down — see the module header
       for (const up of ch.channel.upstreams) {
         if (ch.health.get(up.id)?.checkedAt === null) {
           void this.probeUpstream(ch, up).catch(() => undefined);

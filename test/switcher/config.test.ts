@@ -26,11 +26,13 @@ describe('loadSwitcherConfig', () => {
     return path;
   }
 
-  it('applies all defaults to an empty config', () => {
-    const cfg = loadSwitcherConfig(writeConfig(''));
+  const CONTROLLER_URL = 'ws://controller:8080/ws/switcher';
+
+  it('applies all defaults to a config with only controllerUrl', () => {
+    const cfg = loadSwitcherConfig(writeConfig(`controllerUrl: ${CONTROLLER_URL}\n`));
     expect(cfg).toEqual({
       listen: { host: '0.0.0.0', port: 5590 },
-      stateFile: '/var/lib/switcher/desired.json',
+      controllerUrl: CONTROLLER_URL,
       cacheTtlMs: 2000,
       probeIntervalMs: 15_000,
       stallGraceSec: 10,
@@ -38,11 +40,18 @@ describe('loadSwitcherConfig', () => {
     });
   });
 
+  it('rejects a config missing the required controllerUrl', () => {
+    expect(() => loadSwitcherConfig(writeConfig(''))).toThrow(/invalid config/);
+  });
+
   it('merges partial overrides with defaults', () => {
     const cfg = loadSwitcherConfig(
-      writeConfig('listen: { port: 6600 }\ncacheTtlMs: 500\nstallGraceSec: 20\nsegmentUrls: upstream\n'),
+      writeConfig(
+        `controllerUrl: ${CONTROLLER_URL}\nlisten: { port: 6600 }\ncacheTtlMs: 500\nstallGraceSec: 20\nsegmentUrls: upstream\n`,
+      ),
     );
     expect(cfg.listen).toEqual({ host: '0.0.0.0', port: 6600 });
+    expect(cfg.controllerUrl).toBe(CONTROLLER_URL);
     expect(cfg.cacheTtlMs).toBe(500);
     expect(cfg.stallGraceSec).toBe(20);
     expect(cfg.segmentUrls).toBe('upstream');
@@ -50,20 +59,26 @@ describe('loadSwitcherConfig', () => {
   });
 
   it('rejects an unknown segmentUrls mode', () => {
-    expect(() => loadSwitcherConfig(writeConfig('segmentUrls: proxy\n'))).toThrow(/invalid config/);
+    expect(() => loadSwitcherConfig(writeConfig(`controllerUrl: ${CONTROLLER_URL}\nsegmentUrls: proxy\n`))).toThrow(
+      /invalid config/,
+    );
   });
 
   it('rejects the removed redirect mode loudly instead of silently ignoring it', () => {
-    expect(() => loadSwitcherConfig(writeConfig('segmentUrls: redirect\n'))).toThrow(/invalid config/);
+    expect(() =>
+      loadSwitcherConfig(writeConfig(`controllerUrl: ${CONTROLLER_URL}\nsegmentUrls: redirect\n`)),
+    ).toThrow(/invalid config/);
   });
 
   it('resolves the config path from $SWITCHER_CONFIG', () => {
-    process.env.SWITCHER_CONFIG = writeConfig('listen: { port: 7700 }\n');
+    process.env.SWITCHER_CONFIG = writeConfig(`controllerUrl: ${CONTROLLER_URL}\nlisten: { port: 7700 }\n`);
     expect(loadSwitcherConfig().listen.port).toBe(7700);
   });
 
   it('rejects an invalid port with a clear message', () => {
-    expect(() => loadSwitcherConfig(writeConfig('listen: { port: 70000 }\n'))).toThrow(/invalid config/);
+    expect(() =>
+      loadSwitcherConfig(writeConfig(`controllerUrl: ${CONTROLLER_URL}\nlisten: { port: 70000 }\n`)),
+    ).toThrow(/invalid config/);
   });
 
   it('throws a readable error for a missing file', () => {
