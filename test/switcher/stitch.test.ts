@@ -6,7 +6,7 @@
  * Injected fetch + fake clock throughout.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   Stitcher,
   UnknownChannelError,
@@ -545,6 +545,106 @@ describe('onDemandIdle channels', () => {
 
     await stitcher.probeAll();
     expect(net.calls).toHaveLength(0); // still no probe traffic
+  });
+});
+
+describe('on-demand cold-start hold (waitServeable)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function setupOnDemand() {
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch(); // cold: no routes registered — every fetch 404s
+    const stitcher = new Stitcher({
+      cacheTtlMs: 2000,
+      stallGraceSec: 10,
+      fetchImpl: net.fetchImpl,
+      now: () => clock.nowMs,
+    });
+    const doc = desiredDoc();
+    doc.channels[0]!.onDemand = true;
+    stitcher.applyDesired(doc);
+    return { clock, net, stitcher };
+  }
+
+  /** advances the injected clock and the fake timers together, in `step`-sized ticks */
+  async function tick(clock: { nowMs: number }, totalMs: number, step = 1000): Promise<void> {
+    let left = totalMs;
+    while (left > 0) {
+      const dt = Math.min(step, left);
+      clock.nowMs += dt;
+      await vi.advanceTimersByTimeAsync(dt);
+      left -= dt;
+    }
+  }
+
+  it('isOnDemand mirrors the pushed onDemand flag', () => {
+    const { stitcher } = setupOnDemand();
+    expect(stitcher.isOnDemand('ch1')).toBe(true);
+    expect(stitcher.isOnDemand('nope')).toBe(false);
+  });
+
+  it('resolves true immediately when the active upstream is already serveable', async () => {
+    const { net, stitcher } = setupOnDemand();
+    liveUpstream(net, NODE_A, { nowMs: T0 + 1000 });
+    expect(await stitcher.waitServeable('ch1', 1_000)).toBe(true);
+  });
+
+  it('resolves true once the active upstream becomes serveable mid-poll', async () => {
+    const { clock, net, stitcher } = setupOnDemand();
+    const p = stitcher.waitServeable('ch1', 20_000);
+    let settled: boolean | undefined;
+    void p.then((r) => {
+      settled = r;
+    });
+
+    await tick(clock, 6_000); // several failed poll cycles while cold
+    expect(settled).toBeUndefined(); // still holding, well short of the 20s deadline
+
+    liveUpstream(net, NODE_A, clock); // the encode comes up
+    await tick(clock, 4_000); // at least one more poll cycle to notice
+
+    expect(await p).toBe(true);
+  });
+
+  it('resolves false once the deadline elapses without ever becoming serveable', async () => {
+    const { clock, stitcher } = setupOnDemand();
+    const p = stitcher.waitServeable('ch1', 5_000);
+    await tick(clock, 7_000); // safely past the deadline, cold throughout
+    expect(await p).toBe(false);
+  });
+
+  it('does not record a health transition while polling a down encode', async () => {
+    const { clock, stitcher } = setupOnDemand();
+    await new Promise((resolve) => setImmediate(resolve)); // settle the eager push probe (unrelated to the hold)
+    const before = stitcher.channelStatuses()[0]!.upstreams.find((u) => u.id === 'p-a');
+    const p = stitcher.waitServeable('ch1', 3_000);
+    await tick(clock, 4_000);
+    expect(await p).toBe(false);
+    const after = stitcher.channelStatuses()[0]!.upstreams.find((u) => u.id === 'p-a');
+    expect(after).toEqual(before); // no health churn caused by the hold's own polling
+  });
+
+  it("a successful probe warms the cache so the caller's post-hold retry avoids a duplicate fetch", async () => {
+    const { net, stitcher } = setupOnDemand();
+    liveUpstream(net, NODE_A, { nowMs: T0 + 1000 });
+    expect(await stitcher.waitServeable('ch1', 1_000)).toBe(true);
+    const callsBefore = net.calls.length;
+    await stitcher.getMasterPlaylist('ch1');
+    expect(net.calls.length).toBe(callsBefore); // served from the still-warm micro-cache
+  });
+
+  it('resolves false promptly when the signal aborts mid-hold', async () => {
+    const { clock, stitcher } = setupOnDemand();
+    const controller = new AbortController();
+    const p = stitcher.waitServeable('ch1', 30_000, controller.signal);
+    await tick(clock, 2_000); // enters the poll loop, still cold
+    controller.abort();
+    expect(await p).toBe(false);
   });
 });
 

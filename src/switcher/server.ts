@@ -24,7 +24,7 @@
  * link (controllerLink.ts, contract/ws1.ts) instead of this HTTP surface.
  */
 
-import fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
+import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { SwitcherStatus } from '../contract/v1.js';
 import type { ControllerLink } from './controllerLink.js';
 import {
@@ -45,6 +45,15 @@ export interface SwitcherServerOptions {
 
 const HLS_CONTENT_TYPE = 'application/vnd.apple.mpegurl';
 
+/**
+ * Server-side cap on the on-demand cold-start hold (stitch.ts#waitServeable).
+ * The stock player (shaka-player) gives up on its own after ~20.5s (a 10s
+ * connectionTimeout attempt, one retry with a fresh 10s budget), but a
+ * tuned/other client may hold longer, so the server enforces its own ceiling
+ * rather than trusting the client to go away.
+ */
+const HOLD_CAP_MS = 30_000;
+
 function sendHlsError(reply: FastifyReply, err: unknown): FastifyReply {
   if (err instanceof UnknownChannelError || err instanceof UnknownVariantError) {
     return reply.code(404).send({ error: err.message });
@@ -53,6 +62,29 @@ function sendHlsError(reply: FastifyReply, err: unknown): FastifyReply {
     return reply.code(503).header('retry-after', String(err.retryAfterSec)).send({ error: err.message });
   }
   throw err;
+}
+
+/**
+ * Holds a viewer's playlist request open while an `onDemand` channel's
+ * encode is still starting: waits (up to HOLD_CAP_MS) for the active
+ * upstream to become serveable, aborting early if the viewer disconnects.
+ * The caller retries its fetch exactly once regardless of the outcome —
+ * `{ aborted: true }` means don't reply at all (the client is gone).
+ */
+async function holdForServeable(
+  req: FastifyRequest,
+  stitcher: Stitcher,
+  slug: string,
+): Promise<{ aborted: boolean }> {
+  const controller = new AbortController();
+  const onClose = (): void => controller.abort();
+  req.raw.on('close', onClose);
+  try {
+    await stitcher.waitServeable(slug, HOLD_CAP_MS, controller.signal);
+  } finally {
+    req.raw.off('close', onClose);
+  }
+  return { aborted: controller.signal.aborted };
 }
 
 export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
@@ -98,7 +130,20 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
       const text = await stitcher.getMasterPlaylist(req.params.slug);
       return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
     } catch (err) {
-      return sendHlsError(reply, err);
+      if (!(err instanceof UpstreamUnavailableError) || !stitcher.isOnDemand(req.params.slug)) {
+        return sendHlsError(reply, err);
+      }
+      const { aborted } = await holdForServeable(req, stitcher, req.params.slug);
+      if (aborted) {
+        reply.hijack();
+        return reply;
+      }
+      try {
+        const text = await stitcher.getMasterPlaylist(req.params.slug);
+        return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
+      } catch (err2) {
+        return sendHlsError(reply, err2);
+      }
     }
   });
 
@@ -110,7 +155,20 @@ export function buildServer(opts: SwitcherServerOptions): FastifyInstance {
         const text = await stitcher.getMediaPlaylist(req.params.slug, req.params.variant);
         return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
       } catch (err) {
-        return sendHlsError(reply, err);
+        if (!(err instanceof UpstreamUnavailableError) || !stitcher.isOnDemand(req.params.slug)) {
+          return sendHlsError(reply, err);
+        }
+        const { aborted } = await holdForServeable(req, stitcher, req.params.slug);
+        if (aborted) {
+          reply.hijack();
+          return reply;
+        }
+        try {
+          const text = await stitcher.getMediaPlaylist(req.params.slug, req.params.variant);
+          return reply.header('content-type', HLS_CONTENT_TYPE).send(text);
+        } catch (err2) {
+          return sendHlsError(reply, err2);
+        }
       }
     },
   );

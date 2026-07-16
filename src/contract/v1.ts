@@ -358,6 +358,14 @@ export const SwitcherChannel = Type.Object({
    * playlist fetches will 503 until the controller wakes the encode.
    */
   onDemandIdle: Type.Optional(Type.Boolean()),
+  /**
+   * Marker for a channel whose encode starts on viewer demand (all-cold) —
+   * present whether idle or waking (unlike `onDemandIdle`, which drops as
+   * soon as a bring-up row exists even though the encode isn't serving yet).
+   * A viewer's playlist fetch against an unavailable upstream on such a
+   * channel holds the response until the encode comes up instead of 503ing.
+   */
+  onDemand: Type.Optional(Type.Boolean()),
 });
 export type SwitcherChannel = Static<typeof SwitcherChannel>;
 

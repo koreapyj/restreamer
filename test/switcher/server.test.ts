@@ -143,3 +143,105 @@ describe('switcher server', () => {
     expect(link.noteDemand).toHaveBeenCalledWith('solo', 'media');
   });
 });
+
+describe('on-demand cold-start hold', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+  });
+
+  function setupCold(opts: { onDemand?: boolean } = {}) {
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch(); // cold: no routes registered — every fetch 404s
+    const stitcher = new Stitcher({
+      cacheTtlMs: 2000,
+      stallGraceSec: 10,
+      fetchImpl: net.fetchImpl,
+      now: () => clock.nowMs,
+    });
+    const doc = desiredDoc('rev-cold');
+    doc.channels = [
+      {
+        slug: 'coldch',
+        segmentSeconds: 5,
+        onDemand: opts.onDemand ?? true,
+        upstreams: [{ id: 'only', url: 'http://cold-node/media/coldch', priority: 1 }],
+      },
+    ];
+    stitcher.applyDesired(doc);
+    const link = makeLink();
+    const app = buildServer({ stitcher, link, version: '0.0.0-test', nowMs: () => clock.nowMs });
+    return { clock, net, stitcher, link, app };
+  }
+
+  /** advances the injected clock and the fake timers together, in `step`-sized ticks */
+  async function tick(clock: { nowMs: number }, totalMs: number, step = 1000): Promise<void> {
+    let left = totalMs;
+    while (left > 0) {
+      const dt = Math.min(step, left);
+      clock.nowMs += dt;
+      await vi.advanceTimersByTimeAsync(dt);
+      left -= dt;
+    }
+  }
+
+  it('holds the master playlist request until the encode comes up, then serves 200', async () => {
+    const { clock, net, link, app } = setupCold();
+    const p = app.inject({ method: 'GET', url: '/hls/coldch/playlist.m3u8' });
+    await vi.advanceTimersByTimeAsync(0); // let the request reach the handler
+    expect(link.noteDemand).toHaveBeenCalledWith('coldch', 'master'); // fires at arrival, not at reply
+
+    await tick(clock, 5_000); // still cold
+    liveUpstream(net, 'http://cold-node/media/coldch', clock); // the encode comes up
+    await tick(clock, 3_000); // the retry lands once the poll notices
+
+    const res = await p;
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('application/vnd.apple.mpegurl');
+    await app.close();
+  });
+
+  it('holds the variant playlist request until the encode comes up, then serves 200', async () => {
+    const { clock, net, link, app } = setupCold();
+    const p = app.inject({ method: 'GET', url: '/hls/coldch/1080p/stream.m3u8' });
+    await vi.advanceTimersByTimeAsync(0); // let the request reach the handler
+    expect(link.noteDemand).toHaveBeenCalledWith('coldch', 'media');
+
+    await tick(clock, 5_000);
+    liveUpstream(net, 'http://cold-node/media/coldch', clock);
+    await tick(clock, 3_000);
+
+    const res = await p;
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toContain('application/vnd.apple.mpegurl');
+    await app.close();
+  });
+
+  it('falls through to 503 after the hold cap when the encode never comes up', async () => {
+    const { clock, app } = setupCold();
+    const p = app.inject({ method: 'GET', url: '/hls/coldch/playlist.m3u8' });
+    await tick(clock, 31_000); // past HOLD_CAP_MS (30s), still cold throughout
+    const res = await p;
+    expect(res.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('does not hold a non-onDemand channel — 503 is immediate, unchanged', async () => {
+    const { app } = setupCold({ onDemand: false });
+    const res = await app.inject({ method: 'GET', url: '/hls/coldch/playlist.m3u8' });
+    expect(res.statusCode).toBe(503);
+    await app.close();
+  });
+
+  it('aborts the hold and sends no reply when the client disconnects mid-hold', async () => {
+    const { clock, app } = setupCold();
+    const controller = new AbortController();
+    const p = app.inject({ method: 'GET', url: '/hls/coldch/playlist.m3u8', signal: controller.signal });
+    await tick(clock, 3_000); // enters the hold, still cold
+    controller.abort();
+    await expect(p).rejects.toThrow(); // connection reset — no reply was ever sent, and this is the only handle on it
+    await app.close();
+  });
+});

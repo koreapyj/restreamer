@@ -106,6 +106,21 @@
  * this itself: it only reflects `SwitcherChannel.onDemandIdle` from the
  * pushed doc.
  *
+ * ── On-demand cold-start hold ─────────────────────────────────────────────
+ *
+ * `onDemand` marks a channel whose encode starts on viewer demand; unlike
+ * `onDemandIdle` it stays true through bring-up (a failover row can exist
+ * while the encode is still starting, which already drops `onDemandIdle`).
+ * server.ts holds a viewer's playlist request open on such a channel instead
+ * of 503ing when the upstream isn't reachable yet, via `waitServeable()`:
+ * it polls the active upstream until its master AND at least one variant it
+ * lists fetch OK with a real segment, deliberately WITHOUT calling
+ * markHealth — same rationale as onDemandIdle skipping probes, a down
+ * encode nobody's told to come up yet shouldn't churn health transitions.
+ * The demand note (server.ts, `link.noteDemand`) still fires on request
+ * arrival, before the hold — that's what wakes the encode in the first
+ * place, so it must not wait on the very thing it's supposed to trigger.
+ *
  * Pure-ish: fetch and clock are injected; no filesystem access and no
  * persistence — a fresh instance derives its active selection entirely from
  * the pushed doc's `activeUpstreamId` (see applyDesired).
@@ -340,6 +355,8 @@ interface ChannelState {
   variants: Map<string, VariantState>;
   /** mirrors SwitcherChannel.onDemandIdle, refreshed on every applyDesired — see the module header */
   onDemandIdle: boolean;
+  /** mirrors SwitcherChannel.onDemand, refreshed on every applyDesired — see the module header */
+  onDemand: boolean;
 }
 
 interface CacheEntry {
@@ -388,6 +405,11 @@ export class Stitcher {
     return this.desired;
   }
 
+  /** mirrors SwitcherChannel.onDemand for the given channel; false for an unknown slug */
+  isOnDemand(slug: string): boolean {
+    return this.channels.get(slug)?.onDemand ?? false;
+  }
+
   // -------------------------------------------------------------------------
   // Desired state
   // -------------------------------------------------------------------------
@@ -419,9 +441,11 @@ export class Stitcher {
         health: new Map(),
         variants: new Map(),
         onDemandIdle: false,
+        onDemand: false,
       };
       st.channel = channel;
       st.onDemandIdle = channel.onDemandIdle ?? false;
+      st.onDemand = channel.onDemand ?? false;
 
       const ids = new Set(channel.upstreams.map((u) => u.id));
       const health = new Map<string, UpstreamHealth>();
@@ -547,6 +571,58 @@ export class Stitcher {
       `channel ${slug}/${variant}: active upstream unavailable (${upstream.id}: ${res.error ?? `HTTP ${res.status}`})`,
       Math.ceil(ch.channel.segmentSeconds),
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // On-demand cold-start hold
+  // -------------------------------------------------------------------------
+
+  /**
+   * Polls the channel's active upstream until its master playlist fetches OK
+   * AND at least one variant it lists fetches OK with ≥1 segment, or until
+   * timeoutMs elapses — server.ts calls this to hold a viewer's playlist
+   * request open on an `onDemand` channel instead of 503ing while the encode
+   * is still starting up. Never throws: a fetch failure is the expected
+   * state while waiting, not an error condition. Resolves early to `false`
+   * if `signal` aborts (the viewer disconnected — see server.ts).
+   *
+   * Polls through the shared cachedFetch micro-cache rather than bypassing
+   * it: polling faster than cacheTtlMs would just replay the same cached
+   * result, so the interval is aligned to cacheTtlMs (floored at 1s) instead
+   * — and a probe that turns up serveable leaves a warm cache entry that the
+   * caller's own post-hold retry fetch usually lands on for free. Uses the
+   * plain cachedFetch/parse path, never markHealth: this is expected-down
+   * polling, not a health check, so it must not churn health transitions the
+   * way a normal fetch failure would (mirrors onDemandIdle skipping probes).
+   */
+  async waitServeable(slug: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    const ch = this.requireChannel(slug);
+    const pollIntervalMs = Math.max(1000, this.cacheTtlMs);
+    const deadline = this.now() + timeoutMs;
+    for (;;) {
+      if (signal?.aborted) return false;
+      if (await this.probeServeableOnce(ch)) return true;
+      if (signal?.aborted) return false;
+      const remaining = deadline - this.now();
+      if (remaining <= 0) return false;
+      await delay(Math.min(pollIntervalMs, remaining), signal);
+    }
+  }
+
+  /** one serveability check, deliberately bypassing markHealth — see waitServeable */
+  private async probeServeableOnce(ch: ChannelState): Promise<boolean> {
+    const upstream = this.activeUpstream(ch);
+    const master = await this.cachedFetch(upstream, 'playlist.m3u8');
+    if (!master.ok) return false;
+    const { variants } = rewriteMasterPlaylist(master.text, upstream.url);
+    for (const variant of variants) {
+      const media = await this.cachedFetch(upstream, `${variant}/stream.m3u8`);
+      if (media.ok && parseMediaPlaylist(media.text).segments.length > 0) {
+        for (const v of variants) ch.knownVariants.add(v);
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -789,4 +865,20 @@ export class Stitcher {
 
 function trimSlash(url: string): string {
   return url.replace(/\/+$/, '');
+}
+
+/** resolves after ms, or immediately once `signal` aborts — used by waitServeable's poll loop */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
 }
