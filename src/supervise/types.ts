@@ -94,6 +94,12 @@ export interface Timers {
   clearInterval(handle: unknown): void;
 }
 
+/** Directory entry as returned by `readdir(..., {withFileTypes: true})` (node Dirent shape). */
+export interface DirEntry {
+  name: string;
+  isDirectory(): boolean;
+}
+
 /** Filesystem surface used by session/supervisor/store (satisfied by node:fs/promises). */
 export interface FsOps {
   mkdir(path: string, opts: { recursive: true }): Promise<unknown>;
@@ -102,6 +108,7 @@ export interface FsOps {
   readFile(path: string, encoding: 'utf8'): Promise<string>;
   stat(path: string): Promise<{ mtimeMs: number }>;
   rm(path: string, opts: { recursive: true; force: true }): Promise<void>;
+  readdir(path: string, opts: { withFileTypes: true }): Promise<DirEntry[]>;
 }
 
 export interface Logger {

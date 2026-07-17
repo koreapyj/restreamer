@@ -275,6 +275,30 @@ describe('StatusResponse / SessionStatus additions', () => {
     expect(Value.Check(SessionStatus, session)).toBe(true);
     expect(Value.Check(StatusResponse, { ...statusDoc(), sessions: [session] })).toBe(true);
   });
+
+  it('accepts pendingRemovals with and without error, and rejects a bad name', () => {
+    const removal = { name: 'at-x', outDir: '/media/at-x', deadline: '2026-07-06T00:10:00.000Z' };
+    expect(Value.Check(StatusResponse, { ...statusDoc(), pendingRemovals: [removal] })).toBe(true);
+    expect(
+      Value.Check(StatusResponse, { ...statusDoc(), pendingRemovals: [{ ...removal, error: 'EBUSY' }] }),
+    ).toBe(true);
+    expect(Value.Check(StatusResponse, { ...statusDoc(), pendingRemovals: [] })).toBe(true);
+    expect(
+      Value.Check(StatusResponse, { ...statusDoc(), pendingRemovals: [{ ...removal, name: 'Bad_Name' }] }),
+    ).toBe(false);
+  });
+
+  it('accepts lastAppliedAt and persistedStateCorrupt as optional additions', () => {
+    expect(Value.Check(StatusResponse, statusDoc())).toBe(true); // absent (old daemon)
+    expect(
+      Value.Check(StatusResponse, {
+        ...statusDoc(),
+        lastAppliedAt: '2026-07-06T00:00:01.000Z',
+        persistedStateCorrupt: false,
+      }),
+    ).toBe(true);
+    expect(Value.Check(StatusResponse, { ...statusDoc(), persistedStateCorrupt: 'yes' })).toBe(false);
+  });
 });
 
 describe('SwitcherDesiredState', () => {

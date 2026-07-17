@@ -33,11 +33,13 @@ import { buildPipeline } from './pipeline/build.js';
 import { SourcesCatalog } from './sources/catalog.js';
 import { DesiredStore } from './state/desiredStore.js';
 import { Supervisor } from './supervise/supervisor.js';
+import { createDaemonLog } from './util/daemonLog.js';
 import { VERSION } from './version.js';
 
 async function main(): Promise<void> {
-  const logger = console;
   const config = loadConfig();
+  // console + a ring served back over the API (GET /v1/log, /v1/log/stream)
+  const logger = createDaemonLog(console, config.logLines);
 
   // Degrade, don't crash: a bug in one session's plumbing must not take down
   // the supervisor for every other running stream. systemd would restart us,
@@ -71,7 +73,7 @@ async function main(): Promise<void> {
   const catalog = new SourcesCatalog(config.sourcesM3u, { logger });
   await catalog.start();
 
-  const server = createServer({ supervisor, config, catalog, logger });
+  const server = createServer({ supervisor, config, catalog, logger, daemonLog: logger });
   await server.listen({ host: config.listen.host, port: config.listen.port });
   logger.info(
     `restreamer ${VERSION} listening on ${config.listen.host}:${config.listen.port} ` +
@@ -88,6 +90,7 @@ async function main(): Promise<void> {
       // end open SSE log streams first — Fastify's close() waits for in-flight
       // responses and would otherwise hang on them
       supervisor.endAllLogStreams();
+      logger.endLogStreams();
       await server.close().catch((err: unknown) => {
         logger.warn(`server close failed: ${err instanceof Error ? err.message : String(err)}`);
       });

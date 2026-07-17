@@ -555,13 +555,17 @@ export class Session {
     stream.on('error', () => undefined);
   }
 
+  /**
+   * Raw child stderr goes to this session's ring (and its live subscribers)
+   * only — the injected Logger carries lines *about* the session, not the
+   * children's own output.
+   */
   private hookStderr(gen: Generation, stream: Readable, src: 'ffmpeg' | 'tsreadex'): void {
     this.onLines(stream, (line) => {
       gen.lastStderr = line;
       const entry: LogEntry = { ts: this.iso(), src, line };
       this.logRing.push(entry);
       for (const sub of this.logListeners) sub.onLine(entry);
-      this.deps.logger.info(`[${this.name}] ${src}: ${line}`);
     });
   }
 

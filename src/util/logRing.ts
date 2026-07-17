@@ -16,11 +16,11 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-/** One captured log line from a session's children (or its source stream). */
+/** One captured log line from a session's children (or its source stream), or the daemon logger. */
 export interface LogEntry {
   /** ISO 8601 */
   ts: string;
-  src: 'ffmpeg' | 'tsreadex' | 'source';
+  src: 'ffmpeg' | 'tsreadex' | 'source' | 'daemon';
   line: string;
 }
 

@@ -233,6 +233,17 @@ export const SessionStatus = Type.Object({
 });
 export type SessionStatus = Static<typeof SessionStatus>;
 
+/** A removed session (or boot-time orphan dir) whose deferred `rm -rf outDir` has not completed yet. */
+export const PendingRemoval = Type.Object({
+  name: SessionName,
+  outDir: Type.String(),
+  /** ISO 8601 — when the next rm attempt fires */
+  deadline: Type.String(),
+  /** message of the last failed rm attempt; present only while retrying */
+  error: Type.Optional(Type.String()),
+});
+export type PendingRemoval = Static<typeof PendingRemoval>;
+
 /** GET /v1/status response. */
 export const StatusResponse = Type.Object({
   apiVersion: Type.Literal(1),
@@ -253,6 +264,12 @@ export const StatusResponse = Type.Object({
    */
   sourcesHash: Type.Optional(Type.Union([Type.String(), Type.Null()])),
   sessions: Type.Array(SessionStatus),
+  /** deferred outDir removals still draining (or retrying after a failed rm). Absent = old daemon. */
+  pendingRemovals: Type.Optional(Type.Array(PendingRemoval)),
+  /** ISO 8601 — when a desired doc was last applied (PUT or boot-time disk load). Absent = never / old daemon. */
+  lastAppliedAt: Type.Optional(Type.String()),
+  /** true while the persisted doc found at boot fails schema validation (cleared by a successful PUT) */
+  persistedStateCorrupt: Type.Optional(Type.Boolean()),
 });
 export type StatusResponse = Static<typeof StatusResponse>;
 
@@ -303,6 +320,10 @@ export type SourcesResponse = Static<typeof SourcesResponse>;
 // LogLine (replays the ring tail on connect, then streams live lines);
 // `event: end` when the session object is discarded (config change /
 // removal) — reconnect to pick up any replacement session under the name.
+//
+// GET /v1/log?lines=N — `{lines: LogLine[]}` tail of the daemon's own log
+// ring (src 'daemon'); GET /v1/log/stream — the same over SSE with identical
+// framing to the per-session stream (`event: end` on daemon shutdown).
 //
 // POST /v1/sessions/:name/restarts/reset — zeroes the lifetime `restarts`
 // counter without disturbing the running process group; 404 for unknown or

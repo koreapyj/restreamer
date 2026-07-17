@@ -34,7 +34,7 @@
 
 import fsp from 'node:fs/promises';
 import { Value } from '@sinclair/typebox/value';
-import { type DesiredSession, DesiredState, type SessionStatus } from '../contract/v1.js';
+import { type DesiredSession, DesiredState, type PendingRemoval, type SessionStatus } from '../contract/v1.js';
 import type { DaemonConfig } from '../config.js';
 import type { DesiredStore } from '../state/desiredStore.js';
 import { stableHash } from '../util/hash.js';
@@ -43,6 +43,7 @@ import { defaultTimers, Session } from './session.js';
 import type {
   BuildPipeline,
   BuiltPipeline,
+  DirEntry,
   FsOps,
   Logger,
   LogSubscriber,
@@ -54,6 +55,16 @@ import type {
 
 /** ceiling for a *derived* cleanup delay, guarding against a misconfigured huge listSize */
 const CLEANUP_DELAY_MAX_SEC = 3600;
+
+/**
+ * drain grace for orphan dirs found in serveDir at boot: their pipeline
+ * config (and thus a derivable HLS window) is unknown, so they get this
+ * fixed delay before removal
+ */
+const ORPHAN_CLEANUP_DELAY_SEC = 600;
+
+/** retry interval after a failed `rm -rf outDir` */
+const RM_RETRY_DELAY_SEC = 60;
 
 /** hls_time driving the derived playlist-stall threshold + cleanup delay */
 function pipelineSegmentSeconds(p: DesiredSession['pipeline']): number {
@@ -74,13 +85,15 @@ interface SessionEntry {
   invalidError?: string;
 }
 
-/** a removal whose `rm -rf outDir` is scheduled but not yet fired */
+/** a removal whose `rm -rf outDir` is scheduled but not yet fired (or being retried) */
 interface PendingDeletion {
   outDir: string;
   timer: unknown;
   deadlineMs: number;
   /** identity across schedule/cancel/fire — neutralizes an already-fired stale timer */
   token: number;
+  /** message of the last failed rm attempt; present only while retrying */
+  error?: string;
 }
 
 export interface SupervisorDeps {
@@ -90,8 +103,8 @@ export interface SupervisorDeps {
   logger?: Logger;
   /** injectable for tests; default constructs a real Session from config */
   sessionFactory?: SessionFactory;
-  /** used only for `rm -rf outDir` on removal */
-  fs?: Pick<FsOps, 'rm'>;
+  /** `rm -rf outDir` on removal + the boot-time serveDir orphan sweep; missing methods fall back to node:fs/promises */
+  fs?: Partial<Pick<FsOps, 'rm' | 'readdir'>>;
   /** clock + timer seam for the deferred-deletion timer; default real timers */
   timers?: Timers;
   daemonVersion?: string;
@@ -106,12 +119,17 @@ export class Supervisor {
   private readonly config: DaemonConfig;
   private readonly logger: Logger;
   private readonly sessionFactory: SessionFactory;
-  private readonly fs: Pick<FsOps, 'rm'>;
+  private readonly fs: Pick<FsOps, 'rm' | 'readdir'>;
   private readonly timers: Timers;
 
   /** removals awaiting a deferred `rm -rf outDir`, keyed by session name */
   private readonly pendingDeletions = new Map<string, PendingDeletion>();
   private deletionSeq = 0;
+
+  /** ISO 8601 instant of the last successfully applied desired doc (PUT or disk load) */
+  private lastAppliedAtIso: string | undefined;
+  /** true when startFromDisk found a persisted doc that fails schema validation */
+  private persistedCorrupt = false;
 
   private reconcileChain: Promise<void> = Promise.resolve();
   private reconcileQueued = false;
@@ -122,7 +140,7 @@ export class Supervisor {
     this.store = deps.store;
     this.config = deps.config;
     this.logger = deps.logger ?? console;
-    this.fs = deps.fs ?? fsp;
+    this.fs = { rm: fsp.rm, readdir: fsp.readdir, ...deps.fs };
     this.timers = deps.timers ?? defaultTimers;
     this.sessionFactory =
       deps.sessionFactory ??
@@ -184,27 +202,33 @@ export class Supervisor {
     }
     await this.store.save(doc);
     this.desired = doc;
+    this.lastAppliedAtIso = new Date(this.timers.now()).toISOString();
+    this.persistedCorrupt = false;
     await this.reconcile();
   }
 
-  /** Load the persisted doc and reconcile; missing/corrupt state ⇒ zero sessions. */
+  /**
+   * Load the persisted doc and reconcile; missing/corrupt state ⇒ zero
+   * sessions. Afterwards, serveDir is swept: any top-level directory that is
+   * neither a desired session's outDir nor already pending deletion is an
+   * orphan (left behind by an earlier daemon exit) and gets a deferred rm.
+   */
   async startFromDisk(): Promise<void> {
     const doc = await this.store.load();
     if (doc === null) {
       this.desired = null;
-      await this.reconcile();
-      return;
-    }
-    if (!Value.Check(DesiredState, doc)) {
+    } else if (!Value.Check(DesiredState, doc)) {
       this.logger.error(
         'persisted desired state no longer passes schema validation — starting with zero sessions, waiting for a controller push',
       );
+      this.persistedCorrupt = true;
       this.desired = null;
-      await this.reconcile();
-      return;
+    } else {
+      this.desired = doc;
+      this.lastAppliedAtIso = new Date(this.timers.now()).toISOString();
     }
-    this.desired = doc;
     await this.reconcile();
+    await this.sweepOrphans();
   }
 
   /** One reconcile at a time; concurrent requests coalesce onto the latest desired doc. */
@@ -240,20 +264,15 @@ export class Supervisor {
   }
 
   /**
-   * Parallel graceful stop of everything (SIGTERM path). Sessions never throw on
-   * stop. Any deferred deletions are flushed synchronously — the process exits
-   * right after, so draining is moot and leaving them would orphan the dirs.
+   * Parallel graceful stop of everything (SIGTERM path). Sessions never throw
+   * on stop. Deferred-deletion (and rm-retry) timers are disarmed but the
+   * dirs are left on disk: nginx keeps serving the segments, so a drain
+   * outlives the daemon — the boot-time orphan sweep picks the dirs up again
+   * on the next start.
    */
   async stopAll(): Promise<void> {
     await Promise.all([...this.sessions.values()].map((entry) => entry.session?.stop()));
-    const pending = [...this.pendingDeletions.values()];
-    this.pendingDeletions.clear();
-    await Promise.all(
-      pending.map((p) => {
-        this.timers.clearTimeout(p.timer);
-        return this.rmOutDir(p.outDir);
-      }),
-    );
+    for (const p of this.pendingDeletions.values()) this.timers.clearTimeout(p.timer);
   }
 
   async restartSession(name: string): Promise<void> {
@@ -302,6 +321,30 @@ export class Supervisor {
     return true;
   }
 
+  /** removals whose deferred `rm -rf outDir` has not completed yet (GET /v1/status) */
+  pendingRemovals(): PendingRemoval[] {
+    const out: PendingRemoval[] = [];
+    for (const [name, p] of this.pendingDeletions) {
+      out.push({
+        name,
+        outDir: p.outDir,
+        deadline: new Date(p.deadlineMs).toISOString(),
+        ...(p.error !== undefined ? { error: p.error } : {}),
+      });
+    }
+    return out;
+  }
+
+  /** ISO 8601 instant of the last successfully applied desired doc; undefined until one applies */
+  get lastAppliedAt(): string | undefined {
+    return this.lastAppliedAtIso;
+  }
+
+  /** true while the persisted doc found at boot fails schema validation (cleared by a successful PUT) */
+  get persistedStateCorrupt(): boolean {
+    return this.persistedCorrupt;
+  }
+
   statuses(): SessionStatus[] {
     const out: SessionStatus[] = [];
     for (const entry of this.sessions.values()) {
@@ -328,18 +371,9 @@ export class Supervisor {
     const desiredByName = new Map<string, DesiredSession>();
     for (const session of this.desired?.sessions ?? []) desiredByName.set(session.name, session);
 
-    // a name that is desired again while its dir's deletion is still pending
-    // (the on-demand idle-stop → viewer-returns pattern) must not resume into
-    // that stale directory — disarm the timer and rm it now, so the revived
-    // session's create/start below starts a fresh dir instead of appending
-    // onto a playlist a player may still be reading
-    for (const name of desiredByName.keys()) {
-      const pending = this.pendingDeletions.get(name);
-      if (!pending) continue;
-      this.timers.clearTimeout(pending.timer);
-      this.pendingDeletions.delete(name);
-      await this.rmOutDir(pending.outDir);
-    }
+    // a name that is desired again cancels any pending deletion of its dir — the
+    // (re)created session legitimately reuses serveDir/<name> (as restart does)
+    for (const name of desiredByName.keys()) this.cancelDeletion(name);
 
     // removed → graceful stop, then rm -rf outDir (deferred by cleanupDelaySec)
     for (const [name, entry] of [...this.sessions]) {
@@ -352,7 +386,7 @@ export class Supervisor {
       if (this.config.cleanupOnRemove && entry.outDir) {
         const delayMs = this.resolveCleanupDelayMs(entry.desired);
         if (delayMs <= 0) {
-          await this.rmOutDir(entry.outDir);
+          await this.deleteNow(name, entry.outDir);
         } else {
           this.scheduleDeletion(name, entry.outDir, delayMs);
         }
@@ -416,9 +450,7 @@ export class Supervisor {
     const deadlineMs = this.timers.now() + delayMs;
     const timer = this.timers.setTimeout(() => this.fireDeletion(name, token), delayMs);
     this.pendingDeletions.set(name, { outDir, timer, deadlineMs, token });
-    this.logger.info(
-      `[supervisor] session ${name} removed — cleanup of ${outDir} deferred ${Math.round(delayMs / 1000)}s`,
-    );
+    this.logger.info(`[supervisor] cleanup of ${outDir} deferred ${Math.round(delayMs / 1000)}s`);
   }
 
   private cancelDeletion(name: string): void {
@@ -433,16 +465,70 @@ export class Supervisor {
     void this.runExclusive(async () => {
       const pending = this.pendingDeletions.get(name);
       if (!pending || pending.token !== token) return; // cancelled or superseded
-      this.pendingDeletions.delete(name);
-      await this.rmOutDir(pending.outDir);
+      await this.attemptDeletion(name, pending);
     });
   }
 
-  private async rmOutDir(outDir: string): Promise<void> {
-    await this.fs.rm(outDir, { recursive: true, force: true }).catch((err: unknown) => {
+  /** Immediate rm (cleanup delay 0) — a failure still lands in pendingDeletions for retry. */
+  private async deleteNow(name: string, outDir: string): Promise<void> {
+    this.cancelDeletion(name);
+    const token = ++this.deletionSeq;
+    const pending: PendingDeletion = { outDir, timer: undefined, deadlineMs: this.timers.now(), token };
+    this.pendingDeletions.set(name, pending);
+    await this.attemptDeletion(name, pending);
+  }
+
+  /**
+   * One `rm -rf outDir` attempt for a pending deletion. Success clears the
+   * entry; failure keeps it — with `error` surfaced via pendingRemovals() —
+   * and re-arms a fixed-interval retry. Runs on the reconcile chain (callers
+   * hold the exclusivity), so it can never overlap a session (re)creating
+   * the same dir.
+   */
+  private async attemptDeletion(name: string, pending: PendingDeletion): Promise<void> {
+    try {
+      await this.fs.rm(pending.outDir, { recursive: true, force: true });
+      if (this.pendingDeletions.get(name)?.token === pending.token) this.pendingDeletions.delete(name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       this.logger.warn(
-        `[supervisor] cleanup of ${outDir} failed: ${err instanceof Error ? err.message : String(err)}`,
+        `[supervisor] cleanup of ${pending.outDir} failed (retrying in ${RM_RETRY_DELAY_SEC}s): ${msg}`,
       );
+      if (this.pendingDeletions.get(name)?.token !== pending.token) return; // cancelled during the rm
+      const token = ++this.deletionSeq;
+      const delayMs = RM_RETRY_DELAY_SEC * 1000;
+      const deadlineMs = this.timers.now() + delayMs;
+      const timer = this.timers.setTimeout(() => this.fireDeletion(name, token), delayMs);
+      this.pendingDeletions.set(name, { outDir: pending.outDir, timer, deadlineMs, token, error: msg });
+    }
+  }
+
+  /**
+   * Boot-time serveDir sweep: a top-level directory owned by no desired
+   * session and no pending deletion is an orphan (left behind by an earlier
+   * daemon exit) — schedule its rm after the fixed orphan drain grace.
+   * Non-directories are ignored; the whole sweep is skipped when
+   * cleanupOnRemove is off. A readdir failure logs a warning and skips.
+   */
+  private async sweepOrphans(): Promise<void> {
+    if (!this.config.cleanupOnRemove) return;
+    let entries: DirEntry[];
+    try {
+      entries = await this.fs.readdir(this.config.serveDir, { withFileTypes: true });
+    } catch (err) {
+      this.logger.warn(
+        `[supervisor] orphan sweep of ${this.config.serveDir} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    const desired = new Set((this.desired?.sessions ?? []).map((s) => s.name));
+    await this.runExclusive(async () => {
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (desired.has(entry.name) || this.pendingDeletions.has(entry.name)) continue;
+        this.logger.info(`[supervisor] orphan dir ${entry.name} found in ${this.config.serveDir}`);
+        this.scheduleDeletion(entry.name, `${this.config.serveDir}/${entry.name}`, ORPHAN_CLEANUP_DELAY_SEC * 1000);
+      }
     });
   }
 }

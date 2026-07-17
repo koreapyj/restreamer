@@ -618,6 +618,37 @@ describe('on-demand cold-start hold (waitServeable)', () => {
     expect(await p).toBe(false);
   });
 
+  it('re-resolves the active upstream URL from a mid-hold applyDesired (same id, rotated url)', async () => {
+    const { clock, net, stitcher } = setupOnDemand();
+    const NODE_A_ROTATED = 'http://node-a.example/hls/ch1-activation-2';
+    const p = stitcher.waitServeable('ch1', 20_000);
+    let settled: boolean | undefined;
+    void p.then((r) => {
+      settled = r;
+    });
+
+    await tick(clock, 6_000); // several failed polls against the original (dead) url
+    expect(settled).toBeUndefined();
+
+    // controller pushes a doc mid-hold: p-a keeps its id but moves to a new
+    // activation path; only the rotated url is ever live
+    liveUpstream(net, NODE_A_ROTATED, clock);
+    const doc = desiredDoc('rev-2');
+    doc.channels[0]!.onDemand = true;
+    doc.channels[0]!.upstreams = [
+      { id: 'p-a', url: NODE_A_ROTATED, priority: 1 },
+      { id: 'p-b', url: NODE_B, priority: 2 },
+    ];
+    stitcher.applyDesired(doc);
+
+    await tick(clock, 4_000); // at least one more poll cycle to pick up the new url
+
+    expect(await p).toBe(true);
+    const media = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(segmentUrisOf(media).length).toBeGreaterThan(0);
+    expect(segmentUrisOf(media).every((u) => u.startsWith(segPrefix(NODE_A_ROTATED)))).toBe(true);
+  });
+
   it('does not record a health transition while polling a down encode', async () => {
     const { clock, stitcher } = setupOnDemand();
     await new Promise((resolve) => setImmediate(resolve)); // settle the eager push probe (unrelated to the hold)

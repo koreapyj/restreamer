@@ -33,6 +33,7 @@ import { templates } from '../pipeline/templates/index.js';
 import type { SourcesCatalog } from '../sources/catalog.js';
 import type { Supervisor } from '../supervise/supervisor.js';
 import type { Logger } from '../supervise/types.js';
+import { createDaemonLog, type DaemonLog } from '../util/daemonLog.js';
 import { VERSION } from '../version.js';
 
 export interface ServerDeps {
@@ -41,12 +42,15 @@ export interface ServerDeps {
   /** local external-sources catalog (GET /v1/sources, status sourcesHash) */
   catalog: SourcesCatalog;
   logger?: Logger;
+  /** daemon-level log ring (GET /v1/log, /v1/log/stream); default wraps `logger` in a fresh ring */
+  daemonLog?: DaemonLog;
 }
 
 /** Fastify instance implementing the daemon side of the wire contract v1. */
 export function createServer(deps: ServerDeps): FastifyInstance {
   const { supervisor, config, catalog } = deps;
   const logger = deps.logger ?? console;
+  const daemonLog = deps.daemonLog ?? createDaemonLog(logger, config.logLines);
   const startedAtMs = Date.now();
   const startedAtIso = new Date(startedAtMs).toISOString();
 
@@ -77,6 +81,10 @@ export function createServer(deps: ServerDeps): FastifyInstance {
     desiredRevision: supervisor.desiredRevision,
     sourcesHash: catalog.hash,
     sessions: supervisor.statuses(),
+    pendingRemovals: supervisor.pendingRemovals(),
+    // undefined until a doc has ever been applied — JSON serialization drops it
+    lastAppliedAt: supervisor.lastAppliedAt,
+    persistedStateCorrupt: supervisor.persistedStateCorrupt,
   }));
 
   app.get('/v1/sources', async () => catalog.snapshot());
@@ -230,6 +238,96 @@ export function createServer(deps: ServerDeps): FastifyInstance {
       cleanup();
       return;
     }
+    unsubscribe = subscription.unsubscribe;
+    keepalive = setInterval(() => {
+      if (closed) return;
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        cleanup();
+      }
+    }, 25_000);
+    req.raw.on('close', cleanup);
+    req.raw.on('error', cleanup);
+  });
+
+  app.get('/v1/log', async (req, reply) => {
+    const raw = (req.query as { lines?: string }).lines;
+    let lines = config.logLines;
+    if (raw !== undefined) {
+      lines = Number(raw);
+      if (!Number.isInteger(lines) || lines < 0) {
+        return reply.status(400).send({ error: `invalid lines parameter: ${raw}` });
+      }
+    }
+    return { lines: daemonLog.logTail(lines) };
+  });
+
+  /**
+   * Server-Sent Events: the daemon logger's ring tail as `event: log` frames
+   * (payload = LogLine with src 'daemon'), then live lines; `event: end` on
+   * shutdown (endLogStreams before server close). Same framing, slow-client
+   * cutoff and keepalive as the per-session stream.
+   */
+  app.get('/v1/log/stream', (req, reply) => {
+    const raw = (req.query as { lines?: string }).lines;
+    let tailLines = config.logLines;
+    if (raw !== undefined) {
+      tailLines = Number(raw);
+      if (!Number.isInteger(tailLines) || tailLines < 0) {
+        return reply.status(400).send({ error: `invalid lines parameter: ${raw}` });
+      }
+    }
+
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no', // nginx: never buffer SSE
+    });
+    res.write('retry: 3000\n\n');
+
+    const MAX_BUFFERED_BYTES = 256 * 1024;
+    let closed = false;
+    let keepalive: unknown;
+    let unsubscribe: (() => void) | undefined;
+    const cleanup = (): void => {
+      if (closed) return;
+      closed = true;
+      if (keepalive !== undefined) clearInterval(keepalive as NodeJS.Timeout);
+      unsubscribe?.();
+      try {
+        res.end();
+      } catch {
+        /* connection already gone */
+      }
+    };
+    const send = (event: string, data: unknown): void => {
+      if (closed) return;
+      // slow client: drop the connection instead of buffering unboundedly
+      if (res.writableLength > MAX_BUFFERED_BYTES) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        cleanup();
+      }
+    };
+
+    // tail + listener registration is atomic inside subscribeLog — no line is
+    // duplicated or dropped across the replay/live boundary
+    const subscription = daemonLog.subscribeLog(tailLines, {
+      onLine: (entry) => send('log', entry),
+      onEnd: () => {
+        send('end', {});
+        cleanup();
+      },
+    });
+    for (const entry of subscription.tail) send('log', entry);
     unsubscribe = subscription.unsubscribe;
     keepalive = setInterval(() => {
       if (closed) return;

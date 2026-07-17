@@ -114,7 +114,17 @@ describe('Supervisor', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function makeSupervisor(opts: { config?: Partial<DaemonConfig>; factory?: SessionFactory; timers?: Timers } = {}) {
+  function makeSupervisor(
+    opts: {
+      config?: Partial<DaemonConfig>;
+      factory?: SessionFactory;
+      timers?: Timers;
+      /** serveDir listing seen by the boot-time orphan sweep (default: empty) */
+      dirEntries?: { name: string; isDirectory(): boolean }[];
+      /** paths whose rm fails with this message (retry-path tests) */
+      rmFails?: Map<string, string>;
+    } = {},
+  ) {
     const factory: SessionFactory =
       opts.factory ??
       ((init) => {
@@ -130,12 +140,17 @@ describe('Supervisor', () => {
       sessionFactory: factory,
       fs: {
         rm: async (p: string) => {
+          const failMsg = opts.rmFails?.get(p);
+          if (failMsg !== undefined) throw new Error(failMsg);
           rmCalls.push(p);
         },
+        readdir: async () => opts.dirEntries ?? [],
       },
       ...(opts.timers ? { timers: opts.timers } : {}),
     });
   }
+
+  const dirEntry = (name: string, isDir = true) => ({ name, isDirectory: () => isDir });
 
   function byName(sup: Supervisor, name: string): SessionStatus | undefined {
     return sup.statuses().find((s) => s.name === name);
@@ -429,32 +444,29 @@ describe('Supervisor', () => {
       expect(clock.pending()).toBe(0);
     });
 
-    it('re-adding a session before its deletion fires rms the stale dir immediately and starts fresh', async () => {
+    it('re-adding a session before its deletion fires cancels the deletion (name reuse)', async () => {
       const clock = manualTimers();
       const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
       await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
       await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → schedule
       await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add before fire
 
-      expect(clock.pending()).toBe(0); // original timer disarmed
-      expect(rmCalls).toEqual(['/media/beta']); // stale dir removed before the revived session started
+      expect(clock.pending()).toBe(0); // timer disarmed
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual([]); // dir was never deleted — reused by the new session
       expect(byName(sup, 'beta')?.state).toBe('running');
-
-      await clock.tick(600_000); // past the original deadline
-      expect(rmCalls).toEqual(['/media/beta']); // the disarmed timer never fires a second rm
     });
 
-    it('rapid remove→add→remove rms the stale dir on revival, then again after the final delay', async () => {
+    it('rapid remove→add→remove reschedules and deletes exactly once', async () => {
       const clock = manualTimers();
       const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
       await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
-      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove (token 1) → schedule
-      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add → immediate rm, fresh start
-      expect(rmCalls).toEqual(['/media/beta']);
-      await sup.applyDesired(doc('rev-4', [sess('alpha')])); // remove again (token 2) → schedule
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove (token 1)
+      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add (cancel)
+      await sup.applyDesired(doc('rev-4', [sess('alpha')])); // remove again (token 2)
 
       await clock.tick(600_000);
-      expect(rmCalls).toEqual(['/media/beta', '/media/beta']); // revival rm + final delayed rm
+      expect(rmCalls).toEqual(['/media/beta']); // exactly one deletion
     });
 
     it('in-place replace (hash change, no removal in between) does not rm the dir', async () => {
@@ -468,18 +480,227 @@ describe('Supervisor', () => {
       expect(rmCalls).toEqual([]);
     });
 
-    it('stopAll flushes pending deletions synchronously', async () => {
+    it('stopAll disarms pending deletion timers but leaves the dirs on disk (drain outlives the daemon)', async () => {
       const clock = manualTimers();
       const sup = makeSupervisor({ config: { cleanupDelaySec: null }, timers: clock.timers });
       await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
       await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → pending
 
       await sup.stopAll();
-      expect(rmCalls).toEqual(['/media/beta']); // flushed without ticking
-      expect(clock.pending()).toBe(0);
+      expect(rmCalls).toEqual([]); // dir kept — nginx is still serving the drain
+      expect(clock.pending()).toBe(0); // but the timer is disarmed
 
-      await clock.tick(600_000); // no double-delete
+      await clock.tick(600_000); // nothing fires after shutdown
+      expect(rmCalls).toEqual([]);
+    });
+  });
+
+  describe('pendingRemovals / lastAppliedAt / persistedStateCorrupt (status surface)', () => {
+    it('reports a scheduled removal with its outDir and ISO deadline, then clears on fire', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 30 }, timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // remove beta → schedule at now+30s
+
+      expect(sup.pendingRemovals()).toEqual([
+        { name: 'beta', outDir: '/media/beta', deadline: new Date(30_000).toISOString() },
+      ]);
+
+      await clock.tick(30_000);
       expect(rmCalls).toEqual(['/media/beta']);
+      expect(sup.pendingRemovals()).toEqual([]);
+    });
+
+    it('a failed rm keeps the entry with error set and retries after 60s; success clears it', async () => {
+      const clock = manualTimers();
+      const rmFails = new Map([['/media/beta', 'EBUSY: resource busy']]);
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 30 }, timers: clock.timers, rmFails });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
+
+      await clock.tick(30_000); // deletion fires — rm fails
+      expect(rmCalls).toEqual([]);
+      expect(sup.pendingRemovals()).toEqual([
+        { name: 'beta', outDir: '/media/beta', deadline: new Date(90_000).toISOString(), error: 'EBUSY: resource busy' },
+      ]);
+      expect(clock.pending()).toBe(1); // retry armed
+
+      await clock.tick(60_000); // first retry — still failing
+      expect(sup.pendingRemovals()[0]?.error).toBe('EBUSY: resource busy');
+      expect(sup.pendingRemovals()[0]?.deadline).toBe(new Date(150_000).toISOString());
+
+      rmFails.delete('/media/beta'); // dir becomes removable
+      await clock.tick(60_000); // second retry succeeds
+      expect(rmCalls).toEqual(['/media/beta']);
+      expect(sup.pendingRemovals()).toEqual([]);
+      expect(clock.pending()).toBe(0);
+    });
+
+    it('an immediate rm (cleanupDelaySec 0) that fails also lands in pendingRemovals and retries', async () => {
+      const clock = manualTimers();
+      const rmFails = new Map([['/media/beta', 'EPERM: operation not permitted']]);
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 0 }, timers: clock.timers, rmFails });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')]));
+
+      expect(sup.pendingRemovals()[0]?.error).toBe('EPERM: operation not permitted');
+
+      rmFails.clear();
+      await clock.tick(60_000);
+      expect(rmCalls).toEqual(['/media/beta']);
+      expect(sup.pendingRemovals()).toEqual([]);
+    });
+
+    it('re-adding a name whose rm is in retry cancels the retry (dir reused)', async () => {
+      const clock = manualTimers();
+      const rmFails = new Map([['/media/beta', 'EBUSY']]);
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 0 }, timers: clock.timers, rmFails });
+      await sup.applyDesired(doc('rev-1', [sess('alpha'), sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [sess('alpha')])); // rm fails → retry pending
+      expect(sup.pendingRemovals()).toHaveLength(1);
+
+      await sup.applyDesired(doc('rev-3', [sess('alpha'), sess('beta')])); // re-add
+      expect(sup.pendingRemovals()).toEqual([]);
+      expect(clock.pending()).toBe(0);
+      await clock.tick(120_000);
+      expect(rmCalls).toEqual([]); // cancelled retry never fires
+    });
+
+    it('stopAll disarms a pending rm-retry timer too', async () => {
+      const clock = manualTimers();
+      const rmFails = new Map([['/media/beta', 'EBUSY']]);
+      const sup = makeSupervisor({ config: { cleanupDelaySec: 0 }, timers: clock.timers, rmFails });
+      await sup.applyDesired(doc('rev-1', [sess('beta')]));
+      await sup.applyDesired(doc('rev-2', [])); // rm fails → retry armed
+
+      await sup.stopAll();
+      expect(clock.pending()).toBe(0);
+    });
+
+    it('sets lastAppliedAt on a successful PUT and on a boot-time disk load', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ timers: clock.timers });
+      expect(sup.lastAppliedAt).toBeUndefined();
+
+      await clock.tick(5_000);
+      await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+      expect(sup.lastAppliedAt).toBe(new Date(5_000).toISOString());
+
+      const clock2 = manualTimers();
+      const sup2 = makeSupervisor({ timers: clock2.timers });
+      await clock2.tick(9_000);
+      await sup2.startFromDisk();
+      expect(sup2.lastAppliedAt).toBe(new Date(9_000).toISOString());
+    });
+
+    it('a rejected PUT does not move lastAppliedAt', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({ timers: clock.timers });
+      await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+      const applied = sup.lastAppliedAt;
+
+      await clock.tick(1_000);
+      await expect(sup.applyDesired(doc('rev-2', [sess('unbuildable-x')]))).rejects.toThrow();
+      expect(sup.lastAppliedAt).toBe(applied);
+    });
+
+    it('startFromDisk with no doc sets neither lastAppliedAt nor the corrupt flag', async () => {
+      const sup = makeSupervisor();
+      await sup.startFromDisk();
+      expect(sup.lastAppliedAt).toBeUndefined();
+      expect(sup.persistedStateCorrupt).toBe(false);
+    });
+
+    it('flags a persisted doc that fails schema validation; a successful PUT clears the flag', async () => {
+      // valid JSON, invalid schema (apiVersion 99)
+      await writeFile(join(dir, 'desired.json'), JSON.stringify({ apiVersion: 99, revision: 'x', sessions: [] }));
+      const sup = makeSupervisor();
+      await sup.startFromDisk();
+      expect(sup.persistedStateCorrupt).toBe(true);
+      expect(sup.lastAppliedAt).toBeUndefined();
+      expect(sup.statuses()).toEqual([]);
+
+      await sup.applyDesired(doc('rev-1', [sess('alpha')]));
+      expect(sup.persistedStateCorrupt).toBe(false);
+      expect(sup.lastAppliedAt).toBeDefined();
+    });
+  });
+
+  describe('boot-time orphan sweep', () => {
+    it('schedules deletion of serveDir dirs owned by no desired session, after the fixed orphan grace', async () => {
+      const clock = manualTimers();
+      const store = new DesiredStore(join(dir, 'desired.json'), silentLogger);
+      await store.save(doc('rev-1', [sess('alpha')]));
+      const sup = makeSupervisor({
+        timers: clock.timers,
+        dirEntries: [dirEntry('alpha'), dirEntry('stale-1'), dirEntry('stale-2')],
+      });
+      await sup.startFromDisk();
+
+      expect(sup.pendingRemovals().map((p) => p.name).sort()).toEqual(['stale-1', 'stale-2']);
+      expect(sup.pendingRemovals()[0]?.deadline).toBe(new Date(600_000).toISOString());
+
+      await clock.tick(600_000 - 1);
+      expect(rmCalls).toEqual([]);
+      await clock.tick(1);
+      expect(rmCalls.sort()).toEqual(['/media/stale-1', '/media/stale-2']);
+      expect(sup.pendingRemovals()).toEqual([]);
+    });
+
+    it('ignores plain files in serveDir', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({
+        timers: clock.timers,
+        dirEntries: [dirEntry('notes.txt', false), dirEntry('stale')],
+      });
+      await sup.startFromDisk();
+      expect(sup.pendingRemovals().map((p) => p.name)).toEqual(['stale']);
+    });
+
+    it('skips the sweep entirely when cleanupOnRemove is false', async () => {
+      const clock = manualTimers();
+      const sup = makeSupervisor({
+        config: { cleanupOnRemove: false },
+        timers: clock.timers,
+        dirEntries: [dirEntry('stale')],
+      });
+      await sup.startFromDisk();
+      expect(sup.pendingRemovals()).toEqual([]);
+      expect(clock.pending()).toBe(0);
+    });
+
+    it('a readdir failure logs and skips the sweep', async () => {
+      const clock = manualTimers();
+      const sup = new Supervisor({
+        buildPipeline,
+        store: new DesiredStore(join(dir, 'desired.json'), silentLogger),
+        config: testConfig(),
+        logger: silentLogger,
+        sessionFactory: (init) => new FakeSession(init),
+        fs: {
+          rm: async () => undefined,
+          readdir: async () => {
+            throw new Error('EACCES: permission denied');
+          },
+        },
+        timers: clock.timers,
+      });
+      await sup.startFromDisk(); // must not throw
+      expect(sup.pendingRemovals()).toEqual([]);
+    });
+
+    it('a desired session name found on disk survives the sweep even while sessions are running', async () => {
+      const clock = manualTimers();
+      const store = new DesiredStore(join(dir, 'desired.json'), silentLogger);
+      await store.save(doc('rev-1', [sess('alpha'), sess('beta')]));
+      const sup = makeSupervisor({
+        timers: clock.timers,
+        dirEntries: [dirEntry('alpha'), dirEntry('beta')],
+      });
+      await sup.startFromDisk();
+      expect(sup.pendingRemovals()).toEqual([]);
+      await clock.tick(600_000);
+      expect(rmCalls).toEqual([]);
     });
   });
 });

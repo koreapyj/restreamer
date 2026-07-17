@@ -247,6 +247,24 @@ export function memFs(): MemFs {
           }
         }
       },
+      readdir: async (p) => {
+        // top-level entries inferred from stored file paths: `<p>/x` is a
+        // file, `<p>/x/...` makes `x` a directory
+        const prefix = `${norm(p)}/`;
+        const dirs = new Set<string>();
+        const plain = new Set<string>();
+        for (const key of files.keys()) {
+          if (!key.startsWith(prefix)) continue;
+          const rest = key.slice(prefix.length);
+          const slash = rest.indexOf('/');
+          if (slash >= 0) dirs.add(rest.slice(0, slash));
+          else plain.add(rest);
+        }
+        return [
+          ...[...dirs].map((name) => ({ name, isDirectory: () => true })),
+          ...[...plain].filter((name) => !dirs.has(name)).map((name) => ({ name, isDirectory: () => false })),
+        ];
+      },
     },
   };
 }
