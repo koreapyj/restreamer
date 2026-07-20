@@ -340,7 +340,7 @@ export class ControllerLink {
           break;
         }
         try {
-          this.stitcher.switchTo(msg.slug, msg.upstreamId, 'manual');
+          this.stitcher.switchTo(msg.slug, msg.upstreamId, msg.reason ?? 'manual', msg.era);
         } catch (err) {
           if (err instanceof UnknownChannelError || err instanceof UnknownUpstreamError) {
             this.logger.warn(`controller link: ${err.message}`);

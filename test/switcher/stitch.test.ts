@@ -21,7 +21,9 @@ import {
   desiredDoc,
   discCount,
   discSeqOf,
+  labeledEntries,
   liveUpstream,
+  liveUpstreamPerVariant,
   makeFetch,
   mediaPlaylist,
   segEntries,
@@ -709,5 +711,245 @@ describe('micro-cache', () => {
     clock.nowMs += 2500; // past cacheTtlMs (2000)
     await stitcher.getMediaPlaylist('ch1', '1080p');
     expect(net.calls.filter((u) => u === mediaUrl)).toHaveLength(2);
+  });
+});
+
+/*
+ * Era-anchored deterministic replicas: with controller-minted `eras`
+ * (+ doc-carried `offsets`), two independent Stitcher instances derive
+ * identical MEDIA-SEQUENCE / DISCONTINUITY-SEQUENCE / labeling purely from
+ * shared upstream content + the anchor — never from local wall clock. Absent
+ * eras, every existing wall-clock assertion above (lines ~94, ~158, ~332)
+ * must keep passing unchanged — the legacy path is untouched byte-for-byte.
+ */
+describe('era-anchored deterministic replicas', () => {
+  function newStitcher(net: ReturnType<typeof makeFetch>, clock: { nowMs: number }) {
+    return new Stitcher({ cacheTtlMs: 2000, stallGraceSec: 10, fetchImpl: net.fetchImpl, now: () => clock.nowMs });
+  }
+
+  it('two replicas with different local clocks render byte-identical playlists from the same doc + anchor', async () => {
+    const OFFSET = 500_000;
+    const contentClock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, contentClock, {});
+    liveUpstream(net, NODE_B, contentClock, {});
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': OFFSET, arib_1: OFFSET } },
+    ];
+
+    // instance 1 thinks it's "now"; instance 2's local clock is wildly
+    // different (500s ahead) — only the shared upstream content clock and
+    // the doc-carried anchor may influence the rendered output
+    const clockReplica1 = { nowMs: T0 + 1000 };
+    const clockReplica2 = { nowMs: T0 + 500_000 };
+    const replica1 = newStitcher(net, clockReplica1);
+    const replica2 = newStitcher(net, clockReplica2);
+    replica1.applyDesired(doc);
+    replica2.applyDesired(doc);
+
+    const v1 = await replica1.getMediaPlaylist('ch1', '1080p');
+    const v2 = await replica2.getMediaPlaylist('ch1', '1080p');
+    expect(v2).toBe(v1);
+    const a1 = await replica1.getMediaPlaylist('ch1', 'arib_1');
+    const a2 = await replica2.getMediaPlaylist('ch1', 'arib_1');
+    expect(a2).toBe(a1);
+
+    // sanity: this is really the era path, not a legacy coincidence — the
+    // label reflects rawSeq + OFFSET, not either replica's local timeBase
+    const firstK = timeBase(contentClock.nowMs) - 6;
+    expect(seqOf(v1)).toBe(firstK + OFFSET);
+    expect(seqOf(v1)).not.toBe(timeBase(clockReplica1.nowMs));
+    expect(seqOf(v1)).not.toBe(timeBase(clockReplica2.nowMs));
+  });
+
+  it('a late joiner matches the already-running instance, with no synthesized discontinuity on its first render', async () => {
+    const OFFSET = 200_000;
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': OFFSET } }];
+
+    const running = newStitcher(net, clock);
+    running.applyDesired(doc);
+    await running.getMediaPlaylist('ch1', '1080p'); // establishes the running instance's window
+
+    clock.nowMs += 30_000; // time passes while `running` keeps serving
+    const runningText = await running.getMediaPlaylist('ch1', '1080p');
+
+    // a fresh replica boots now, from the same doc/content
+    const lateJoiner = newStitcher(net, clock);
+    lateJoiner.applyDesired(doc);
+    const joinerText = await lateJoiner.getMediaPlaylist('ch1', '1080p');
+
+    expect(discCount(joinerText)).toBe(0); // no synthesized disc on a replica's own first render
+
+    // every segment the two instances have in common carries the identical
+    // implied label — a viewer failing over between replicas sees no jump
+    const runningByUri = new Map(labeledEntries(runningText).map((e) => [e.uri, e.label]));
+    const joinerEntries = labeledEntries(joinerText);
+    const overlap = joinerEntries.filter((e) => runningByUri.has(e.uri));
+    expect(overlap.length).toBeGreaterThan(0); // the test actually exercises overlap
+    for (const e of overlap) expect(e.label).toBe(runningByUri.get(e.uri));
+  });
+
+  it('chains labels consecutively across A→B→C switches, and DISCONTINUITY-SEQUENCE tracks the oldest buffered era', async () => {
+    const NODE_C = 'http://node-c/media/ch1';
+    const OFFSET0 = 500_000;
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    liveUpstream(net, NODE_B, clock, {});
+    liveUpstream(net, NODE_C, clock, {});
+    const doc = desiredDoc();
+    doc.channels[0]!.upstreams = [
+      { id: 'p-a', url: NODE_A, priority: 1 },
+      { id: 'p-b', url: NODE_B, priority: 2 },
+      { id: 'p-c', url: NODE_C, priority: 3 },
+    ];
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': OFFSET0 } }];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const text0 = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(discCount(text0)).toBe(0);
+    const seam1Pdt = segEntries(text0).at(-1)!.pdt + 5000;
+
+    // no offsets carried on these switch frames — the running replica must
+    // derive C_v for era 1 / era 2 itself, at the seam, from its own buffer
+    stitcher.switchTo('ch1', 'p-b', 'manual', { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seam1Pdt });
+    clock.nowMs = T0 + 8000;
+    const text1 = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const seam2Pdt = segEntries(text1).at(-1)!.pdt + 5000;
+
+    stitcher.switchTo('ch1', 'p-c', 'manual', { eraIndex: 2, upstreamId: 'p-c', splicePdtMs: seam2Pdt });
+    clock.nowMs = T0 + 13_000;
+    const text2 = await stitcher.getMediaPlaylist('ch1', '1080p');
+
+    // labels stay globally consecutive across both seams — no per-era re-basing
+    const entries = labeledEntries(text2);
+    for (let i = 1; i < entries.length; i += 1) {
+      expect(entries[i]!.label).toBe(entries[i - 1]!.label + 1);
+    }
+    expect(discCount(text2)).toBeGreaterThanOrEqual(1); // at most two boundaries still in-window
+    expect(discCount(text2)).toBeLessThanOrEqual(2);
+    expect(segmentUrisOf(text2).at(-1)).toContain(segPrefix(NODE_C));
+
+    // once both seams age fully off the front, DISCONTINUITY-SEQUENCE tracks
+    // the oldest buffered segment's era index directly (no incremental
+    // bookkeeping needed: era indices are controller-assigned, +1 per switch)
+    let drained = '';
+    for (let step = 1; step <= 10; step += 1) {
+      clock.nowMs = T0 + 13_000 + step * 5000;
+      drained = await stitcher.getMediaPlaylist('ch1', '1080p');
+    }
+    expect(segmentUrisOf(drained).every((u) => u.startsWith(segPrefix(NODE_C)))).toBe(true);
+    expect(discCount(drained)).toBe(0);
+    expect(discSeqOf(drained)).toBe(2);
+  });
+
+  it('legacy fallback (no eras) renders byte-for-byte identical output whether the field is absent or an empty array', async () => {
+    const { stitcher, clock } = setup(); // desiredDoc() carries no `eras` field at all
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(seqOf(text)).toBe(timeBase(clock.nowMs));
+    expect(discSeqOf(text)).toBe(0);
+
+    const clock2 = { nowMs: clock.nowMs };
+    const net2 = makeFetch();
+    liveUpstream(net2, NODE_A, clock2, {});
+    liveUpstream(net2, NODE_B, clock2, {});
+    const stitcher2 = newStitcher(net2, clock2);
+    const doc2 = desiredDoc();
+    doc2.channels[0]!.eras = []; // explicitly empty, rather than omitted
+    stitcher2.applyDesired(doc2);
+    const text2 = await stitcher2.getMediaPlaylist('ch1', '1080p');
+    expect(text2).toBe(text); // byte-for-byte identical to the omitted-field case
+
+    // legacy discontinuity/splice bookkeeping (state.discSeq, not era.eraIndex) unaffected
+    stitcher.switchTo('ch1', 'p-b', 'manual');
+    clock.nowMs += 5000;
+    const afterSwitch = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(discCount(afterSwitch)).toBe(1);
+    expect(discSeqOf(afterSwitch)).toBe(0);
+  });
+
+  it('derives per-variant chain constants independently under different upstream MEDIA-SEQUENCE offsets/cadence', async () => {
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    // two variants from independent encoder processes: wildly different raw
+    // MEDIA-SEQUENCE bases for the exact same wall-clock content window
+    liveUpstreamPerVariant(net, NODE_A, clock, {
+      '1080p': { seqOffset: 0 },
+      arib_1: { seqOffset: 900_000 },
+    });
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000, arib_1: -800_000 } },
+    ];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const video = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const audio = await stitcher.getMediaPlaylist('ch1', 'arib_1');
+
+    // each variant's chain constant compensates for its own rawSeq base —
+    // both land on the same channel-wide label despite the raw divergence
+    const firstK = timeBase(clock.nowMs) - 6;
+    expect(seqOf(video)).toBe(firstK + 100_000);
+    expect(seqOf(audio)).toBe(firstK + 100_000);
+    expect(seqOf(video)).toBe(seqOf(audio));
+
+    const status = stitcher.channelStatuses()[0]!;
+    expect(status.eraOffsets).toEqual({ '1080p': { '0': 100_000 }, arib_1: { '0': -800_000 } });
+  });
+
+  it('a doc-adopted C_v overrides local derivation, and fallback-seeded variants are never reported', async () => {
+    // --- part A: local seam derivation, then a doc push overrides it ---
+    const clockA = { nowMs: T0 + 1000 };
+    const netA = makeFetch();
+    liveUpstream(netA, NODE_A, clockA, {});
+    liveUpstream(netA, NODE_B, clockA, {});
+    const docA = desiredDoc();
+    docA.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000 } }];
+    const stitcherA = newStitcher(netA, clockA);
+    stitcherA.applyDesired(docA);
+    const text0 = await stitcherA.getMediaPlaylist('ch1', '1080p');
+    const seamPdt = segEntries(text0).at(-1)!.pdt + 5000;
+
+    // switch WITHOUT a doc-carried offset for era 1 — forces local derivation
+    stitcherA.switchTo('ch1', 'p-b', 'manual', { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt });
+    clockA.nowMs += 5000;
+    await stitcherA.getMediaPlaylist('ch1', '1080p');
+    const localOffsets = stitcherA.channelStatuses()[0]!.eraOffsets;
+    const localC = localOffsets?.['1080p']?.['1'];
+    expect(localC).toBeDefined();
+
+    // the controller later persists a different canonical value and pushes it
+    const overrideC = localC! + 777;
+    const docB = desiredDoc('rev-2');
+    docB.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000 } },
+      { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt, offsets: { '1080p': overrideC } },
+    ];
+    stitcherA.applyDesired(docB);
+    const overridden = stitcherA.channelStatuses()[0]!.eraOffsets;
+    expect(overridden?.['1080p']?.['1']).toBe(overrideC); // doc value wins over local derivation
+
+    // --- part B: a variant that can never derive a chain constant falls
+    // back to legacy and is never reported ---
+    const clockC = { nowMs: T0 + 1000 };
+    const netC = makeFetch();
+    liveUpstream(netC, NODE_A, clockC, {});
+    const docC = desiredDoc();
+    // splicePdtMs far beyond anything served — no segment ever classifies
+    // into this era, so bootstrapping aborts and the variant commits to the
+    // legacy path permanently (never populates `chain` at all)
+    docC.channels[0]!.eras = [{ eraIndex: 3, upstreamId: 'p-a', splicePdtMs: T0 + 10_000_000 }];
+    const stitcherC = newStitcher(netC, clockC);
+    stitcherC.applyDesired(docC);
+    const fallbackText = await stitcherC.getMediaPlaylist('ch1', '1080p');
+    expect(seqOf(fallbackText)).toBe(timeBase(clockC.nowMs)); // legacy numbering, unaffected
+    expect(stitcherC.channelStatuses()[0]!.eraOffsets).toBeUndefined(); // fallback-seeded values never reported
   });
 });

@@ -360,6 +360,22 @@ export const SwitcherUpstream = Type.Object({
 });
 export type SwitcherUpstream = Static<typeof SwitcherUpstream>;
 
+/**
+ * Controller-minted anchor for one era (initial activation | switch) of a
+ * channel's history. `splicePdtMs` is null only for era 0. Replicas derive
+ * per-variant segment numbering from (anchor + shared upstream playlist
+ * content) — no controller→node fetches involved.
+ */
+export const EraAnchor = Type.Object({
+  eraIndex: Type.Integer(),
+  upstreamId: Type.String(),
+  /** null: era 0 */
+  splicePdtMs: Type.Union([Type.Integer(), Type.Null()]),
+  /** variant -> chain constant C_v, present once known (controller-persisted from replica reports) */
+  offsets: Type.Optional(Type.Record(Type.String(), Type.Integer())),
+});
+export type EraAnchor = Static<typeof EraAnchor>;
+
 export const SwitcherChannel = Type.Object({
   /** URL path segment: `GET /hls/<slug>/playlist.m3u8` */
   slug: SessionName,
@@ -387,6 +403,8 @@ export const SwitcherChannel = Type.Object({
    * channel holds the response until the encode comes up instead of 503ing.
    */
   onDemand: Type.Optional(Type.Boolean()),
+  /** recent eras within the drain horizon, newest last, cap 8 */
+  eras: Type.Optional(Type.Array(EraAnchor)),
 });
 export type SwitcherChannel = Static<typeof SwitcherChannel>;
 
@@ -431,6 +449,8 @@ export const SwitcherChannelStatus = Type.Object({
     }),
     Type.Null(),
   ]),
+  /** variant -> eraIndex (as string) -> chain-derived C_v; never includes fallback-seeded values */
+  eraOffsets: Type.Optional(Type.Record(Type.String(), Type.Record(Type.String(), Type.Integer()))),
 });
 export type SwitcherChannelStatus = Static<typeof SwitcherChannelStatus>;
 

@@ -154,6 +154,25 @@ export function liveUpstream(net: FakeNet, base: string, clock: { nowMs: number 
   return opts;
 }
 
+/**
+ * Like `liveUpstream`, but each variant can carry independent `LiveOpts`
+ * (e.g. a different raw MEDIA-SEQUENCE base or segment cadence per variant —
+ * real independent encoder processes per rendition). Variants not present in
+ * `variantOpts` default to `{}`.
+ */
+export function liveUpstreamPerVariant(
+  net: FakeNet,
+  base: string,
+  clock: { nowMs: number },
+  variantOpts: Partial<Record<(typeof VARIANTS)[number], LiveOpts>>,
+): void {
+  net.routes[`${base}/playlist.m3u8`] = () => masterPlaylist();
+  for (const v of VARIANTS) {
+    const opts = variantOpts[v] ?? {};
+    net.routes[`${base}/${v}/stream.m3u8`] = () => liveMediaText(clock.nowMs, opts);
+  }
+}
+
 export const seqOf = (text: string): number => {
   const m = /#EXT-X-MEDIA-SEQUENCE:(\d+)/.exec(text);
   if (!m?.[1]) throw new Error(`no MEDIA-SEQUENCE in:\n${text}`);
@@ -180,6 +199,16 @@ export const segPrefix = (base: string, variant = '1080p'): string => `${base}/$
 /** count of served segment URIs sourced from the given upstream (identified by its base URL) */
 export const countFor = (text: string, upstreamBase: string, variant = '1080p'): number =>
   segmentUrisOf(text).filter((u) => u.startsWith(segPrefix(upstreamBase, variant))).length;
+
+/**
+ * Each served segment URI paired with its implied virtual/era label
+ * (MEDIA-SEQUENCE + position — universal HLS semantics, independent of
+ * whether the switcher happened to number it via the legacy or era path).
+ */
+export const labeledEntries = (text: string): { uri: string; label: number }[] => {
+  const base = seqOf(text);
+  return segmentUrisOf(text).map((uri, i) => ({ uri, label: base + i }));
+};
 
 /** each segment URI paired with its preceding PROGRAM-DATE-TIME (NaN if none) */
 export const segEntries = (text: string): { pdt: number; uri: string }[] => {
