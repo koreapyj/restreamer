@@ -73,6 +73,39 @@
  *   The base is seeded from the upstream's value on the first render and bumped
  *   as flagged segments slide out.
  *
+ * ── Era numbering (replica-independent MEDIA-SEQUENCE) ─────────────────────
+ *
+ * When the controller supplies `eras`, each admitted segment is assigned to an
+ * era by PDT and labeled `rawSeq + C_v(eraIndex)`. Every replica must derive the
+ * same per-variant chain constant C_v from shared doc + upstream content — local
+ * boot time and the append cutoff must never influence it. Constants are chosen
+ * in this strict order:
+ *
+ *   1. Adopt a doc-carried `offsets[variant]` value.
+ *   2. When a running buffer observes an era seam, extend consecutively with
+ *      `C_new = label(previous) + 1 - rawSeq(first post-seam segment)`.
+ *   3. Otherwise, find the ERA'S first segment in the full parsed upstream
+ *      playlist (not merely the freshly-admitted batch): the first segment
+ *      whose PDT end is after `splicePdtMs`. Its label is anchored at
+ *      `floor(splicePdtMs / 1000 / segmentSeconds)`, yielding
+ *      `C_v = anchorLabel - rawSeq(first era segment)`. If that first segment
+ *      has already slid out of the upstream window, the constant is not
+ *      derivable; doc offsets cover that late-join case.
+ *   4. Era 0 with a null splice stamp and no doc offset remains underivable and
+ *      commits that variant instance to the unchanged legacy path.
+ *
+ * Rules 2 and 3 agree exactly when segment PDTs and splice stamps share the
+ * segment-duration grid (the production 5s alignment): the previous era ends
+ * at anchorLabel - 1 and the new era begins at anchorLabel. On a non-aligned
+ * grid, live seam observation deliberately wins to preserve local consecutive
+ * playback; fresh replicas fall back to rule 3, and replicas seeing the same
+ * doc + upstream window still choose the same labels. Cross-replica identity is
+ * the invariant; equality between the two derivation rules off-grid is not.
+ *
+ * Era capability is decided once per variant instance while its buffer is
+ * empty. A failed bootstrap falls back stickily to legacy numbering, preventing
+ * a later doc change from mixing numbering schemes in one served window.
+ *
  * ── Health probing (no autonomous failover) ────────────────────────────────
  *
  * An upstream is unhealthy when a playlist fetch fails (non-2xx / network
@@ -401,7 +434,7 @@ function classifyEra(eras: EraAnchor[], pdtEndMs: number): number | null {
   return best;
 }
 
-/** Pre-seeds a variant's chain map from doc-carried offsets (disagreement rule 2: doc value overrides local derivation). */
+/** Pre-seeds a variant's chain map from doc-carried offsets (derivation precedence 1: doc value always wins). */
 function seedChainFromEras(eras: EraAnchor[], variant: string, chain: Map<number, number>): void {
   for (const era of eras) {
     const c = era.offsets?.[variant];
@@ -764,10 +797,10 @@ export class Stitcher {
     let labeled: { seg: ParsedSegment; rawSeq: number; eraIndex: number; label: number }[] | null = null;
     if (ch.eras.length > 0 && state.eraCapable !== false) {
       if (state.eraCapable === true) {
-        labeled = this.labelEraBatch(ch, variant, state, fresh, false);
+        labeled = this.labelEraBatch(ch, variant, state, parsed, fresh, false);
       } else if (state.buf.length === 0) {
         if (fresh.length > 0) {
-          const trial = this.labelEraBatch(ch, variant, state, fresh, true);
+          const trial = this.labelEraBatch(ch, variant, state, parsed, fresh, true);
           if (trial !== null) {
             labeled = trial;
             state.eraCapable = true;
@@ -865,11 +898,11 @@ export class Stitcher {
 
   /**
    * Labels a batch of freshly-admitted segments via the era path: era
-   * membership from PDT (`classifyEra`), label = rawSeq + C_v(era). C_v is
-   * doc-adopted when known (rule 2), else extended at a seam from the
-   * previously-labeled segment (`C_new = label(prev) + 1 - rawSeq`), else —
-   * only for the very first segment this variant ever labels — seeded for
-   * era 0 from the anchor's stamp (`floor(splicePdtMs/1000/segmentSeconds)`).
+   * membership from PDT (`classifyEra`), label = rawSeq + C_v(era). C_v follows
+   * the module-header precedence: doc-adopted when known, else extended from a
+   * live-observed seam, else derived from the era's own first segment in the
+   * FULL parsed upstream playlist. The full playlist matters because admission
+   * can exclude that anchor segment even while it remains available upstream.
    *
    * `bootstrapping`: true while state.buf is still empty and era-capability
    * hasn't been decided yet — any single underivable segment aborts the
@@ -883,13 +916,14 @@ export class Stitcher {
     ch: ChannelState,
     variant: string,
     state: VariantState,
+    parsed: ParsedMedia,
     fresh: { seg: ParsedSegment; rawSeq: number }[],
     bootstrapping: boolean,
   ): { seg: ParsedSegment; rawSeq: number; eraIndex: number; label: number }[] | null {
     const out: { seg: ParsedSegment; rawSeq: number; eraIndex: number; label: number }[] = [];
     let running: EraPosition | null = state.buf.length > 0 ? state.buf[state.buf.length - 1]!.era : null;
     for (const { seg, rawSeq } of fresh) {
-      const classified = this.classifySegmentEra(ch, state, seg, rawSeq, running);
+      const classified = this.classifySegmentEra(ch, state, parsed, seg, rawSeq, running);
       if (classified === null) {
         if (bootstrapping) return null;
         this.logger.warn(
@@ -906,6 +940,7 @@ export class Stitcher {
   private classifySegmentEra(
     ch: ChannelState,
     state: VariantState,
+    parsed: ParsedMedia,
     seg: ParsedSegment,
     rawSeq: number,
     running: EraPosition | null,
@@ -924,18 +959,52 @@ export class Stitcher {
     let c = state.chain.get(eraIndex);
     if (c === undefined) {
       if (running !== null) {
-        // chain extension at the seam: labels stay globally consecutive
+        // Precedence 2: a live-observed seam stays globally consecutive even
+        // off the anchor's segment grid; see the module-header consistency note.
         c = running.label + 1 - rawSeq;
-      } else if (eraIndex === 0) {
-        const anchor0 = ch.eras.find((e) => e.eraIndex === 0);
-        if (anchor0?.splicePdtMs == null) return null; // era 0 has no usable timestamp and no offsets: underivable
-        c = Math.floor(anchor0.splicePdtMs / 1000 / ch.channel.segmentSeconds) - rawSeq;
       } else {
-        return null; // mid-era join with no doc offset and no local seam observation
+        // Precedence 3: bootstrap from shared doc + the full upstream window,
+        // never from whichever fresh segment this replica happens to admit first.
+        const derived = this.deriveChainFromParsedEra(ch, parsed, eraIndex);
+        if (derived === null) return null;
+        c = derived;
       }
       state.chain.set(eraIndex, c);
     }
     return { eraIndex, label: rawSeq + c };
+  }
+
+  /**
+   * Derives C_v from the era's actual first segment while that boundary remains
+   * visible in `parsed`. The candidate is the first parsed segment whose PDT end
+   * crosses the era's splice stamp and whose membership is this era. It is
+   * provably the era's first segment when either a pre-era segment precedes it
+   * in the window or the splice stamp falls within/at the candidate itself.
+   * If the window starts strictly after the stamp, the true first segment has
+   * aged out, so return null rather than re-anchor replicas to different raw
+   * sequences. A null era-0 stamp is likewise intentionally underivable.
+   */
+  private deriveChainFromParsedEra(ch: ChannelState, parsed: ParsedMedia, eraIndex: number): number | null {
+    const anchor = ch.eras.find((era) => era.eraIndex === eraIndex);
+    if (anchor?.splicePdtMs == null) return null;
+
+    let sawPreEraSegment = false;
+    for (let i = 0; i < parsed.segments.length; i += 1) {
+      const seg = parsed.segments[i]!;
+      if (seg.pdtMs === null) continue;
+      const pdtEndMs = seg.pdtMs + seg.durationSec * 1000;
+      if (pdtEndMs <= anchor.splicePdtMs) {
+        sawPreEraSegment = true;
+        continue;
+      }
+      if (classifyEra(ch.eras, pdtEndMs) !== eraIndex) return null;
+      if (!sawPreEraSegment && seg.pdtMs > anchor.splicePdtMs) return null;
+
+      const anchorLabel = Math.floor(anchor.splicePdtMs / 1000 / ch.channel.segmentSeconds);
+      const rawSeq = parsed.mediaSequence + i;
+      return anchorLabel - rawSeq;
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------

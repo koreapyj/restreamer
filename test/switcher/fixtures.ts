@@ -89,6 +89,8 @@ export function mediaPlaylist(o: MediaOpts): string {
 export interface LiveOpts {
   segSec?: number;
   window?: number;
+  /** first segment PDT for a newly activated session; no pre-activation segments are emitted */
+  startPdtMs?: number;
   /** added to the natural raw MEDIA-SEQUENCE (use a large negative value to simulate a low-sequence upstream) */
   seqOffset?: number;
   /** upstream frozen this many seconds behind wall clock (stall simulation) */
@@ -107,12 +109,15 @@ export function liveMediaText(nowMs: number, opts: LiveOpts = {}): string {
   const window = opts.window ?? 6;
   const t = nowMs - (opts.staleSec ?? 0) * 1000;
   const newestK = Math.floor(t / segMs) - 1;
-  const firstK = newestK - window + 1;
+  const windowFirstK = newestK - window + 1;
+  const sessionFirstK = opts.startPdtMs === undefined ? windowFirstK : Math.ceil(opts.startPdtMs / segMs);
+  const firstK = Math.max(windowFirstK, sessionFirstK);
+  const count = Math.max(0, newestK - firstK + 1);
   return mediaPlaylist({
     mediaSeq: firstK + (opts.seqOffset ?? 0),
     discSeq: opts.discSeq,
     firstPdtMs: firstK * segMs,
-    count: window,
+    count,
     segSec,
   });
 }

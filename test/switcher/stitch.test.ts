@@ -763,6 +763,109 @@ describe('era-anchored deterministic replicas', () => {
     expect(seqOf(v1)).not.toBe(timeBase(clockReplica2.nowMs));
   });
 
+  it('staggered replicas derive identical era-0 labels without doc offsets', async () => {
+    const anchor0 = T0;
+    const clock = { nowMs: T0 + 31_000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, window: 18 });
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
+
+    const running = newStitcher(net, clock);
+    running.applyDesired(doc);
+    await running.getMediaPlaylist('ch1', '1080p');
+
+    clock.nowMs += 45_000; // the second replica boots nine segments later
+    const runningText = await running.getMediaPlaylist('ch1', '1080p');
+    const lateReplica = newStitcher(net, clock);
+    lateReplica.applyDesired(doc);
+    const lateText = await lateReplica.getMediaPlaylist('ch1', '1080p');
+
+    const runningByUri = new Map(labeledEntries(runningText).map((entry) => [entry.uri, entry.label]));
+    const overlap = labeledEntries(lateText).filter((entry) => runningByUri.has(entry.uri));
+    expect(overlap.length).toBeGreaterThan(0);
+    for (const entry of overlap) expect(entry.label).toBe(runningByUri.get(entry.uri));
+    expect(seqOf(lateText)).toBe(seqOf(runningText));
+    expect(lateText).toBe(runningText); // identical upstream window => identical playlist, including MEDIA-SEQUENCE
+  });
+
+  it('anchors the first era-0 segment label to splicePdtMs instead of local boot time', async () => {
+    const anchor0 = T0;
+    const clock = { nowMs: T0 + 31_000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, window: 12 });
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(segEntries(text)[0]!.pdt).toBe(anchor0);
+    expect(seqOf(text)).toBe(timeBase(anchor0));
+    expect(seqOf(text)).not.toBe(timeBase(clock.nowMs)); // not the legacy wall-clock seed
+  });
+
+  it('a fresh replica joining mid-era 1 derives from the retained upstream boundary and matches a seam observer', async () => {
+    const anchor0 = T0 - 30_000;
+    const seamPdt = T0;
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, window: 12 });
+    liveUpstream(net, NODE_B, clock, { startPdtMs: seamPdt, window: 12 });
+
+    const initialDoc = desiredDoc();
+    initialDoc.channels[0]!.activeUpstreamId = 'p-a';
+    initialDoc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
+    const running = newStitcher(net, clock);
+    running.applyDesired(initialDoc);
+    await running.getMediaPlaylist('ch1', '1080p');
+
+    running.switchTo('ch1', 'p-b', 'manual', { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt });
+    clock.nowMs = T0 + 16_000; // era 1 is underway, but its first segment remains in B's window
+    const runningText = await running.getMediaPlaylist('ch1', '1080p');
+
+    const joinDoc = desiredDoc('rev-2');
+    joinDoc.channels[0]!.activeUpstreamId = 'p-b';
+    joinDoc.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 },
+      { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt },
+    ];
+    const joiner = newStitcher(net, clock);
+    joiner.applyDesired(joinDoc);
+    const joinerText = await joiner.getMediaPlaylist('ch1', '1080p');
+
+    const runningByUri = new Map(labeledEntries(runningText).map((entry) => [entry.uri, entry.label]));
+    const overlap = labeledEntries(joinerText).filter((entry) => runningByUri.has(entry.uri));
+    expect(overlap.length).toBeGreaterThan(0);
+    for (const entry of overlap) expect(entry.label).toBe(runningByUri.get(entry.uri));
+    expect(joiner.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1']).toBe(
+      running.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1'],
+    );
+  });
+
+  it('era 0 with a null splice stamp and no offsets stays on sticky legacy numbering', async () => {
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null }];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const legacy = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(seqOf(legacy)).toBe(timeBase(clock.nowMs));
+    expect(stitcher.channelStatuses()[0]!.eraOffsets).toBeUndefined();
+
+    // Even a later usable stamp cannot relabel an already-buffered legacy
+    // instance; eraCapable=false is intentionally sticky until restart.
+    const updated = desiredDoc('rev-2');
+    updated.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: T0 - 30_000 }];
+    stitcher.applyDesired(updated);
+    clock.nowMs += 5000;
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(stitcher.channelStatuses()[0]!.eraOffsets).toBeUndefined();
+  });
+
   it('a late joiner matches the already-running instance, with no synthesized discontinuity on its first render', async () => {
     const OFFSET = 200_000;
     const clock = { nowMs: T0 + 1000 };
