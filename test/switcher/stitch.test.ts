@@ -763,19 +763,21 @@ describe('era-anchored deterministic replicas', () => {
     expect(seqOf(v1)).not.toBe(timeBase(clockReplica2.nowMs));
   });
 
-  it('staggered replicas derive identical era-0 labels without doc offsets', async () => {
+  it('late bootstrap succeeds after the era-0 boundary has aged out and staggered replicas agree', async () => {
     const anchor0 = T0;
-    const clock = { nowMs: T0 + 31_000 };
+    const clock = { nowMs: T0 + 61_000 };
     const net = makeFetch();
-    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, window: 18 });
+    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, window: 6 });
     const doc = desiredDoc();
     doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
 
     const running = newStitcher(net, clock);
     running.applyDesired(doc);
-    await running.getMediaPlaylist('ch1', '1080p');
+    const initial = await running.getMediaPlaylist('ch1', '1080p');
+    expect(segEntries(initial)[0]!.pdt).toBeGreaterThan(anchor0); // anchor segment is provably gone
+    expect(running.channelStatuses()[0]!.eraOffsets?.['1080p']?.['0']).toBeDefined();
 
-    clock.nowMs += 45_000; // the second replica boots nine segments later
+    clock.nowMs += 45_000; // the second replica boots 45s later
     const runningText = await running.getMediaPlaylist('ch1', '1080p');
     const lateReplica = newStitcher(net, clock);
     lateReplica.applyDesired(doc);
@@ -785,8 +787,52 @@ describe('era-anchored deterministic replicas', () => {
     const overlap = labeledEntries(lateText).filter((entry) => runningByUri.has(entry.uri));
     expect(overlap.length).toBeGreaterThan(0);
     for (const entry of overlap) expect(entry.label).toBe(runningByUri.get(entry.uri));
-    expect(seqOf(lateText)).toBe(seqOf(runningText));
-    expect(lateText).toBe(runningText); // identical upstream window => identical playlist, including MEDIA-SEQUENCE
+    expect(lateText).toBe(runningText);
+  });
+
+  it('backfilled era-0 stamp classifies pre/at/post-stamp segments on the PDT grid', async () => {
+    const anchor0 = T0;
+    const clock = { nowMs: T0 + 100_000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    net.routes[`${NODE_A}/1080p/stream.m3u8`] = () =>
+      mediaPlaylist({ mediaSeq: 700, firstPdtMs: anchor0 - 10_000, count: 4 });
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const labelsByPdt = new Map(
+      segEntries(text).map((entry, i) => [entry.pdt, labeledEntries(text)[i]!.label]),
+    );
+    expect(discSeqOf(text)).toBe(0);
+    expect(labelsByPdt.get(anchor0 - 5000)).toBe(timeBase(anchor0) - 1); // ends exactly at stamp
+    expect(labelsByPdt.get(anchor0)).toBe(timeBase(anchor0)); // ends at stamp + 5s
+    expect(stitcher.channelStatuses()[0]!.eraOffsets?.['1080p']?.['0']).toBeDefined();
+  });
+
+  it('uses the oldest carried era above zero as the catch-all and seeds DISCONTINUITY-SEQUENCE from it', async () => {
+    const clock = { nowMs: T0 + 100_000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    net.routes[`${NODE_A}/1080p/stream.m3u8`] = () =>
+      mediaPlaylist({ mediaSeq: 900, firstPdtMs: T0 - 10_000, count: 6 });
+    const doc = desiredDoc();
+    doc.channels[0]!.eras = [
+      { eraIndex: 5, upstreamId: 'p-a', splicePdtMs: T0 },
+      { eraIndex: 6, upstreamId: 'p-a', splicePdtMs: T0 + 15_000 },
+    ];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(doc);
+
+    const text = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(segEntries(text)[0]!.pdt).toBeLessThan(T0);
+    expect(discSeqOf(text)).toBe(5);
+    expect(discCount(text)).toBe(1);
+    expect(stitcher.channelStatuses()[0]!.eraOffsets?.['1080p']).toEqual(
+      expect.objectContaining({ '5': expect.any(Number), '6': expect.any(Number) }),
+    );
   });
 
   it('anchors the first era-0 segment label to splicePdtMs instead of local boot time', async () => {
@@ -805,7 +851,7 @@ describe('era-anchored deterministic replicas', () => {
     expect(seqOf(text)).not.toBe(timeBase(clock.nowMs)); // not the legacy wall-clock seed
   });
 
-  it('a fresh replica joining mid-era 1 derives from the retained upstream boundary and matches a seam observer', async () => {
+  it('exact-grid seam extension and fresh PDT-grid bootstrap derive the same constant', async () => {
     const anchor0 = T0 - 30_000;
     const seamPdt = T0;
     const clock = { nowMs: T0 + 1000 };
@@ -838,12 +884,58 @@ describe('era-anchored deterministic replicas', () => {
     const overlap = labeledEntries(joinerText).filter((entry) => runningByUri.has(entry.uri));
     expect(overlap.length).toBeGreaterThan(0);
     for (const entry of overlap) expect(entry.label).toBe(runningByUri.get(entry.uri));
-    expect(joiner.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1']).toBe(
-      running.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1'],
-    );
+    const runningC = running.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1'];
+    const joinerC = joiner.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1'];
+    expect(runningC).toBeDefined();
+    expect(joinerC).toBe(runningC);
   });
 
-  it('era 0 with a null splice stamp and no offsets stays on sticky legacy numbering', async () => {
+  it('same placement with a rotated session URL and reset raw sequence stays monotonic with a discontinuity', async () => {
+    const SESSION_2 = 'http://node-a/media/ch1/activation-2';
+    const anchor0 = T0;
+    const rotationPdt = T0 + 30_000;
+    const clock = { nowMs: T0 + 31_000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, { startPdtMs: anchor0, seqOffset: 1_000_000 });
+    liveUpstream(net, SESSION_2, clock, {
+      startPdtMs: rotationPdt,
+      seqOffset: -timeBase(rotationPdt) + 3,
+    });
+
+    const initial = desiredDoc();
+    initial.channels[0]!.activeUpstreamId = 'p-a';
+    initial.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 }];
+    const stitcher = newStitcher(net, clock);
+    stitcher.applyDesired(initial);
+    const session1 = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const lastSession1Label = labeledEntries(session1).at(-1)!.label;
+
+    const rotated = desiredDoc('rev-2');
+    rotated.channels[0]!.activeUpstreamId = 'p-a'; // same placement id: render boundary remains false
+    rotated.channels[0]!.upstreams = [
+      { id: 'p-a', url: SESSION_2, priority: 1 },
+      { id: 'p-b', url: NODE_B, priority: 2 },
+    ];
+    rotated.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: anchor0 },
+      { eraIndex: 1, upstreamId: 'p-a', splicePdtMs: rotationPdt },
+    ];
+    stitcher.applyDesired(rotated);
+    clock.nowMs = T0 + 46_000;
+    const session2 = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const entries = labeledEntries(session2);
+
+    expect(entries[0]!.label).toBe(lastSession1Label + 1);
+    for (let i = 1; i < entries.length; i += 1) {
+      expect(entries[i]!.label).toBe(entries[i - 1]!.label + 1);
+    }
+    expect(discCount(session2)).toBe(1);
+    expect(session2).toContain(`#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:${new Date(rotationPdt).toISOString()}`);
+    expect(entries.at(-1)!.label).toBeGreaterThan(1_000_000); // wall-clock scale, not the reset rawSeq near zero
+    expect(segmentUrisOf(session2).every((uri) => uri.startsWith(segPrefix(SESSION_2)))).toBe(true);
+  });
+
+  it('preserves sticky legacy in place while a fresh Stitcher enters era mode from the usable doc', async () => {
     const clock = { nowMs: T0 + 1000 };
     const net = makeFetch();
     liveUpstream(net, NODE_A, clock, {});
@@ -864,6 +956,12 @@ describe('era-anchored deterministic replicas', () => {
     clock.nowMs += 5000;
     await stitcher.getMediaPlaylist('ch1', '1080p');
     expect(stitcher.channelStatuses()[0]!.eraOffsets).toBeUndefined();
+
+    const fresh = newStitcher(net, clock);
+    fresh.applyDesired(updated);
+    const eraText = await fresh.getMediaPlaylist('ch1', '1080p');
+    expect(fresh.channelStatuses()[0]!.eraOffsets?.['1080p']?.['0']).toBeDefined();
+    expect(seqOf(eraText)).toBe(timeBase(clock.nowMs) - 6); // upstream grid, not the fresh local-time legacy seed
   });
 
   it('a late joiner matches the already-running instance, with no synthesized discontinuity on its first render', async () => {
@@ -1007,52 +1105,61 @@ describe('era-anchored deterministic replicas', () => {
     expect(status.eraOffsets).toEqual({ '1080p': { '0': 100_000 }, arib_1: { '0': -800_000 } });
   });
 
-  it('a doc-adopted C_v overrides local derivation, and fallback-seeded variants are never reported', async () => {
-    // --- part A: local seam derivation, then a doc push overrides it ---
-    const clockA = { nowMs: T0 + 1000 };
-    const netA = makeFetch();
-    liveUpstream(netA, NODE_A, clockA, {});
-    liveUpstream(netA, NODE_B, clockA, {});
-    const docA = desiredDoc();
-    docA.channels[0]!.eras = [{ eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000 } }];
-    const stitcherA = newStitcher(netA, clockA);
-    stitcherA.applyDesired(docA);
-    const text0 = await stitcherA.getMediaPlaylist('ch1', '1080p');
-    const seamPdt = segEntries(text0).at(-1)!.pdt + 5000;
+  it('resets the full variant once on an in-use canonical offset conflict', async () => {
+    const clock = { nowMs: T0 + 1000 };
+    const net = makeFetch();
+    liveUpstream(net, NODE_A, clock, {});
+    liveUpstream(net, NODE_B, clock, { startPdtMs: T0 });
+    const warn = vi.fn();
+    const stitcher = new Stitcher({
+      cacheTtlMs: 2000,
+      stallGraceSec: 10,
+      fetchImpl: net.fetchImpl,
+      now: () => clock.nowMs,
+      logger: { info: vi.fn(), warn, error: vi.fn() },
+    });
+    const initial = desiredDoc();
+    initial.channels[0]!.eras = [
+      { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000 } },
+    ];
+    stitcher.applyDesired(initial);
+    const era0Text = await stitcher.getMediaPlaylist('ch1', '1080p');
 
-    // switch WITHOUT a doc-carried offset for era 1 — forces local derivation
-    stitcherA.switchTo('ch1', 'p-b', 'manual', { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt });
-    clockA.nowMs += 5000;
-    await stitcherA.getMediaPlaylist('ch1', '1080p');
-    const localOffsets = stitcherA.channelStatuses()[0]!.eraOffsets;
-    const localC = localOffsets?.['1080p']?.['1'];
+    stitcher.switchTo('ch1', 'p-b', 'manual', { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: T0 });
+    clock.nowMs = T0 + 6000;
+    await stitcher.getMediaPlaylist('ch1', '1080p');
+    const localC = stitcher.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1'];
     expect(localC).toBeDefined();
 
-    // the controller later persists a different canonical value and pushes it
-    const overrideC = localC! + 777;
-    const docB = desiredDoc('rev-2');
-    docB.channels[0]!.eras = [
+    const canonicalC = localC! + 777;
+    const canonicalDoc = desiredDoc('rev-2');
+    canonicalDoc.channels[0]!.activeUpstreamId = 'p-b';
+    canonicalDoc.channels[0]!.eras = [
       { eraIndex: 0, upstreamId: 'p-a', splicePdtMs: null, offsets: { '1080p': 100_000 } },
-      { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: seamPdt, offsets: { '1080p': overrideC } },
+      { eraIndex: 1, upstreamId: 'p-b', splicePdtMs: T0, offsets: { '1080p': canonicalC } },
     ];
-    stitcherA.applyDesired(docB);
-    const overridden = stitcherA.channelStatuses()[0]!.eraOffsets;
-    expect(overridden?.['1080p']?.['1']).toBe(overrideC); // doc value wins over local derivation
+    stitcher.applyDesired(canonicalDoc);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      `channel ch1/1080p: canonical era offset conflict for era 1 (local ${localC}, canonical ${canonicalC}); resetting variant`,
+    );
 
-    // --- part B: a variant that can never derive a chain constant falls
-    // back to legacy and is never reported ---
-    const clockC = { nowMs: T0 + 1000 };
-    const netC = makeFetch();
-    liveUpstream(netC, NODE_A, clockC, {});
-    const docC = desiredDoc();
-    // splicePdtMs far beyond anything served — no segment ever classifies
-    // into this era, so bootstrapping aborts and the variant commits to the
-    // legacy path permanently (never populates `chain` at all)
-    docC.channels[0]!.eras = [{ eraIndex: 3, upstreamId: 'p-a', splicePdtMs: T0 + 10_000_000 }];
-    const stitcherC = newStitcher(netC, clockC);
-    stitcherC.applyDesired(docC);
-    const fallbackText = await stitcherC.getMediaPlaylist('ch1', '1080p');
-    expect(seqOf(fallbackText)).toBe(timeBase(clockC.nowMs)); // legacy numbering, unaffected
-    expect(stitcherC.channelStatuses()[0]!.eraOffsets).toBeUndefined(); // fallback-seeded values never reported
+    clock.nowMs = T0 + 16_000;
+    const corrected = await stitcher.getMediaPlaylist('ch1', '1080p');
+    const correctedEntries = labeledEntries(corrected);
+    const correctedSegments = segEntries(corrected);
+    expect(segmentUrisOf(corrected).every((uri) => uri.startsWith(segPrefix(NODE_B)))).toBe(true);
+    expect(corrected).not.toContain(segmentUrisOf(era0Text)[0]!); // no pre-reset labels remain mixed in
+    for (let i = 0; i < correctedEntries.length; i += 1) {
+      expect(correctedEntries[i]!.label).toBe(seqOf(corrected) + i);
+      expect(correctedEntries[i]!.label).toBe(timeBase(correctedSegments[i]!.pdt) + canonicalC);
+    }
+    expect(seqOf(corrected)).toBe(timeBase(T0) + canonicalC);
+    expect(stitcher.channelStatuses()[0]!.eraOffsets?.['1080p']?.['1']).toBe(canonicalC);
+
+    stitcher.applyDesired(canonicalDoc);
+    const repeated = await stitcher.getMediaPlaylist('ch1', '1080p');
+    expect(repeated).toBe(corrected);
+    expect(warn).toHaveBeenCalledTimes(1); // identical canonical doc does not reset again
   });
 });

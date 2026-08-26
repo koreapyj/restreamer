@@ -75,36 +75,46 @@
  *
  * ── Era numbering (replica-independent MEDIA-SEQUENCE) ─────────────────────
  *
- * When the controller supplies `eras`, each admitted segment is assigned to an
- * era by PDT and labeled `rawSeq + C_v(eraIndex)`. Every replica must derive the
- * same per-variant chain constant C_v from shared doc + upstream content — local
- * boot time and the append cutoff must never influence it. Constants are chosen
- * in this strict order:
+ * When the controller supplies `eras`, every PDT-bearing segment belongs to the
+ * greatest matching era; the oldest carried era is an unbounded-below catch-all,
+ * so segments predating the oldest retained splice stamp still classify. Each is
+ * labeled `rawSeq + C_v(eraIndex)`. Every replica must derive the same per-variant
+ * chain constant C_v from shared doc + upstream content — local boot time and
+ * the append cutoff must never influence it. Constants are chosen in this strict
+ * order:
  *
  *   1. Adopt a doc-carried `offsets[variant]` value.
  *   2. When a running buffer observes an era seam, extend consecutively with
  *      `C_new = label(previous) + 1 - rawSeq(first post-seam segment)`.
- *   3. Otherwise, find the ERA'S first segment in the full parsed upstream
- *      playlist (not merely the freshly-admitted batch): the first segment
- *      whose PDT end is after `splicePdtMs`. Its label is anchored at
- *      `floor(splicePdtMs / 1000 / segmentSeconds)`, yielding
- *      `C_v = anchorLabel - rawSeq(first era segment)`. If that first segment
- *      has already slid out of the upstream window, the constant is not
- *      derivable; doc offsets cover that late-join case.
- *   4. Era 0 with a null splice stamp and no doc offset remains underivable and
- *      commits that variant instance to the unchanged legacy path.
+ *   3. Otherwise derive from ANY visible PDT segment in that era on the shared
+ *      segment grid. With `S = segmentSeconds * 1000`, `P = splicePdtMs`, and
+ *      `E = segment PDT end`, use:
+ *        anchorLabel = floor(P / S)
+ *        relativeSlot = ceil((E - P) / S) - 1
+ *        C_v = anchorLabel + relativeSlot - rawSeq
+ *      Thus a boundary may age out without making late bootstrap underivable.
+ *   4. An oldest era with a null splice stamp and no doc offset remains
+ *      underivable and commits that variant instance to the unchanged legacy
+ *      path.
  *
- * Rules 2 and 3 agree exactly when segment PDTs and splice stamps share the
- * segment-duration grid (the production 5s alignment): the previous era ends
- * at anchorLabel - 1 and the new era begins at anchorLabel. On a non-aligned
- * grid, live seam observation deliberately wins to preserve local consecutive
- * playback; fresh replicas fall back to rule 3, and replicas seeing the same
- * doc + upstream window still choose the same labels. Cross-replica identity is
- * the invariant; equality between the two derivation rules off-grid is not.
+ * Rules 2 and 3 agree exactly on an aligned seam: the segment ending at P gets
+ * anchorLabel - 1, and the first post-seam segment ending at P + S gets
+ * anchorLabel = previous label + 1. On a non-aligned grid, live seam observation
+ * deliberately wins to preserve local consecutive playback; fresh replicas use
+ * the shared PDT grid. Cross-replica identity is the invariant; equality between
+ * the two derivation rules off-grid is not.
+ *
+ * Doc-carried offsets are canonical. If a later doc conflicts with a locally
+ * derived constant already represented in the served buffer, the whole variant
+ * is reset before adopting all canonical offsets; partially relabeling a buffer
+ * is forbidden. The controller redistributes first-written canonical offsets
+ * quickly, so this is a bounded one-time correction rather than a mixed-label
+ * playlist.
  *
  * Era capability is decided once per variant instance while its buffer is
  * empty. A failed bootstrap falls back stickily to legacy numbering, preventing
- * a later doc change from mixing numbering schemes in one served window.
+ * a later doc change from mixing numbering schemes in one served window; process
+ * replacement is required to retry era mode for such a sticky-legacy state.
  *
  * ── Health probing (no autonomous failover) ────────────────────────────────
  *
@@ -387,7 +397,7 @@ interface VariantState {
   lastPdtEndMs: number | null;
   /** append cutoff (no-PDT fallback) */
   lastRawSeq: number | null;
-  /** eraIndex -> C_v, the per-era chain constant (label = rawSeq + C_v); doc-adopted values override local derivation */
+  /** eraIndex -> C_v, the per-era chain constant (label = rawSeq + C_v); doc-adopted values reconcile canonically */
   chain: Map<number, number>;
   /**
    * Sticky, decided once per VariantState instance: undefined = not yet
@@ -418,17 +428,19 @@ interface ChannelState {
 }
 
 /**
- * Segment belongs to era e iff pdtEnd > splicePdtMs(e) and (no era e+1 or
- * pdtEnd <= splicePdtMs(e+1)) — equivalently the greatest eraIndex whose
- * splicePdtMs is null (era 0, no lower bound) or strictly before pdtEndMs.
- * Returns null when no known era covers the timestamp (predates the drain
- * horizon carried in the doc, or no anchors at all).
+ * Segment belongs to the greatest era whose splice stamp is null or strictly
+ * before its PDT end. The oldest carried era is an unbounded-below catch-all,
+ * so classification is total whenever at least one era is present. The strict
+ * comparison for later eras preserves the boundary rule: a segment ending
+ * exactly at a later splice stamp remains in the preceding era.
  */
 function classifyEra(eras: EraAnchor[], pdtEndMs: number): number | null {
-  let best: number | null = null;
+  if (eras.length === 0) return null;
+  const oldestKnownEraIndex = Math.min(...eras.map((e) => e.eraIndex));
+  let best = oldestKnownEraIndex;
   for (const e of eras) {
-    if (e.splicePdtMs === null || pdtEndMs > e.splicePdtMs) {
-      if (best === null || e.eraIndex > best) best = e.eraIndex;
+    if (e.eraIndex === oldestKnownEraIndex || e.splicePdtMs === null || pdtEndMs > e.splicePdtMs) {
+      if (e.eraIndex > best) best = e.eraIndex;
     }
   }
   return best;
@@ -529,15 +541,13 @@ export class Stitcher {
       st.channel = channel;
       st.onDemandIdle = channel.onDemandIdle ?? false;
       st.onDemand = channel.onDemand ?? false;
-      // doc full-replace wins over any locally WS-merged switch-frame anchors —
-      // the controller's persisted view is authoritative. A late-joining
-      // replica seeds its per-variant chain constants directly from
-      // doc-carried offsets (disagreement rule 2) so its first render matches
-      // an already-running replica's; existing variants get any newer
-      // doc-adopted offsets too, overriding local derivation.
+      // Doc full-replace wins over any locally WS-merged switch-frame anchors —
+      // the controller's persisted view is authoritative. Reconcile canonical
+      // offsets before rendering again; a conflict already represented in a
+      // buffer requires a full variant reset, never partial relabeling.
       st.eras = channel.eras ?? [];
       for (const [variantName, vs] of st.variants) {
-        seedChainFromEras(st.eras, variantName, vs.chain);
+        this.reconcileCanonicalOffsets(st, variantName, vs);
       }
 
       const ids = new Set(channel.upstreams.map((u) => u.id));
@@ -585,6 +595,45 @@ export class Stitcher {
     this.desired = doc;
     this.cache.clear();
     this.probeNeverChecked();
+  }
+
+  /**
+   * Reconciles doc-canonical offsets into an existing VariantState. Missing or
+   * unused values can be adopted in place. A conflicting constant already used
+   * by a buffered segment forces a full reset because later locally-derived
+   * eras may have chained from the old labels; retaining any of that state could
+   * produce a mixed-label playlist.
+   */
+  private reconcileCanonicalOffsets(ch: ChannelState, variant: string, state: VariantState): void {
+    for (const era of ch.eras) {
+      const canonical = era.offsets?.[variant];
+      if (canonical === undefined) continue;
+      const local = state.chain.get(era.eraIndex);
+      if (local === undefined) {
+        state.chain.set(era.eraIndex, canonical);
+        continue;
+      }
+      if (local === canonical) continue;
+      if (!state.buf.some((seg) => seg.era?.eraIndex === era.eraIndex)) {
+        state.chain.set(era.eraIndex, canonical);
+        continue;
+      }
+
+      state.buf = [];
+      state.lastUpstreamId = null;
+      state.lastPdtEndMs = null;
+      state.lastRawSeq = null;
+      state.chain.clear();
+      seedChainFromEras(ch.eras, variant, state.chain);
+      state.eraCapable = undefined;
+      // The controller redistributes first-written canonical offsets within
+      // roughly one 5s status interval. This one-time bounded reset is safer
+      // than relabeling only part of a served playlist.
+      this.logger.warn(
+        `channel ${ch.channel.slug}/${variant}: canonical era offset conflict for era ${era.eraIndex} (local ${local}, canonical ${canonical}); resetting variant`,
+      );
+      return;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -900,9 +949,9 @@ export class Stitcher {
    * Labels a batch of freshly-admitted segments via the era path: era
    * membership from PDT (`classifyEra`), label = rawSeq + C_v(era). C_v follows
    * the module-header precedence: doc-adopted when known, else extended from a
-   * live-observed seam, else derived from the era's own first segment in the
-   * FULL parsed upstream playlist. The full playlist matters because admission
-   * can exclude that anchor segment even while it remains available upstream.
+   * live-observed seam, else derived from any matching PDT segment in the full
+   * parsed upstream playlist. The full playlist matters because admission can
+   * exclude useful derivation segments even while they remain upstream.
    *
    * `bootstrapping`: true while state.buf is still empty and era-capability
    * hasn't been decided yet — any single underivable segment aborts the
@@ -975,34 +1024,28 @@ export class Stitcher {
   }
 
   /**
-   * Derives C_v from the era's actual first segment while that boundary remains
-   * visible in `parsed`. The candidate is the first parsed segment whose PDT end
-   * crosses the era's splice stamp and whose membership is this era. It is
-   * provably the era's first segment when either a pre-era segment precedes it
-   * in the window or the splice stamp falls within/at the candidate itself.
-   * If the window starts strictly after the stamp, the true first segment has
-   * aged out, so return null rather than re-anchor replicas to different raw
-   * sequences. A null era-0 stamp is likewise intentionally underivable.
+   * Derives C_v from any PDT-bearing segment in the parsed window that belongs
+   * to the requested era. The shared PDT grid makes this independent of which
+   * portion of the era remains visible, including oldest-era pre-stamp segments.
+   * A null splice stamp is intentionally underivable without a doc offset.
    */
   private deriveChainFromParsedEra(ch: ChannelState, parsed: ParsedMedia, eraIndex: number): number | null {
     const anchor = ch.eras.find((era) => era.eraIndex === eraIndex);
     if (anchor?.splicePdtMs == null) return null;
 
-    let sawPreEraSegment = false;
+    const segMs = ch.channel.segmentSeconds * 1000;
     for (let i = 0; i < parsed.segments.length; i += 1) {
       const seg = parsed.segments[i]!;
       if (seg.pdtMs === null) continue;
       const pdtEndMs = seg.pdtMs + seg.durationSec * 1000;
-      if (pdtEndMs <= anchor.splicePdtMs) {
-        sawPreEraSegment = true;
-        continue;
-      }
-      if (classifyEra(ch.eras, pdtEndMs) !== eraIndex) return null;
-      if (!sawPreEraSegment && seg.pdtMs > anchor.splicePdtMs) return null;
+      if (classifyEra(ch.eras, pdtEndMs) !== eraIndex) continue;
 
-      const anchorLabel = Math.floor(anchor.splicePdtMs / 1000 / ch.channel.segmentSeconds);
+      const anchorLabel = Math.floor(anchor.splicePdtMs / segMs);
+      const relativeSlot = Math.ceil((pdtEndMs - anchor.splicePdtMs) / segMs) - 1;
       const rawSeq = parsed.mediaSequence + i;
-      return anchorLabel - rawSeq;
+      // At an exactly grid-aligned seam this matches live seam extension:
+      // end=P => anchorLabel-1; end=P+S => anchorLabel=previousLabel+1.
+      return anchorLabel + relativeSlot - rawSeq;
     }
     return null;
   }
