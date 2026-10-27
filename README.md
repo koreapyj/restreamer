@@ -98,7 +98,7 @@ vitest suite deliberately uses only the `.mjs` ones.
 
 ## Installation (Debian package)
 
-CI builds a self-contained amd64 `.deb` of the **daemon only** (the switcher
+CI builds self-contained `amd64` and `arm64` `.deb`s of the **daemon only** (the switcher
 is not packaged — it ships as a container image via
 `deploy/switcher.Dockerfile` / `deploy/k8s/`):
 
@@ -108,7 +108,7 @@ is not packaged — it ships as a container image via
   tagged debs upgrade over rolling ones).
 
 ```sh
-sudo dpkg -i restreamer_<version>_amd64.deb
+sudo dpkg -i restreamer_<version>_<arch>.deb   # arch: amd64 | arm64
 sudo $EDITOR /etc/restreamer/config.yaml
 sudo systemctl enable --now restreamer
 ```
@@ -142,7 +142,8 @@ if you overrode `User=` — add `SupplementaryGroups=render video` via
 
 To build the deb yourself on Linux:
 `pnpm install --frozen-lockfile && bash scripts/build-deb.sh` →
-`out/restreamer_<version>_amd64.deb`.
+`out/restreamer_<version>_<arch>.deb` for the build host's architecture (override with
+`DEB_ARCH=amd64|arm64`; the bundled Node runtime must match the target).
 
 ## Deployment (systemd, manual)
 
@@ -173,7 +174,8 @@ any path prefix:
 CI publishes the switcher container image to GHCR as
 `ghcr.io/<owner>/restreamer-switcher` (built from
 `deploy/switcher.Dockerfile`, pushed only after the shared test suite and an
-on-runner `/v1/healthz` smoke test pass; linux/amd64 only for now):
+on-runner `/v1/healthz` smoke test of each arch pass; multi-arch
+linux/amd64 + linux/arm64):
 
 | ref | image tags |
 |---|---|

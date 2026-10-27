@@ -11,14 +11,17 @@
 #                      X.Y.Z upgrades over any rolling build)
 #
 # Publishing matrix:
-#   tag vX.Y.Z        -> deb attached to the GitHub release for that tag;
+#   tag vX.Y.Z        -> debs attached to the GitHub release for that tag;
 #                        image pushed as :X.Y.Z and :latest
-#   push to main      -> deb attached to the rolling 'main-latest' prerelease
+#   push to main      -> debs attached to the rolling 'main-latest' prerelease
 #                        (recreated each time so old assets don't pile up);
 #                        image pushed as :main and :main-<shortsha>
 #   workflow_dispatch -> on main: same as a main push; on any other ref: no
 #                        release, image pushed as :dev-<shortsha> only
-# Every run also uploads the deb as a workflow artifact, and only pushes the
+# Architectures: the deb is built per arch (amd64, arm64) on a native runner,
+# since it bundles an arch-specific Node runtime; the image is multi-arch
+# (linux/amd64 + linux/arm64).
+# Every run also uploads the debs as workflow artifacts, and only pushes the
 # image after an on-runner /v1/healthz smoke test of both artifacts.
 name: release
 
@@ -71,7 +74,17 @@ jobs:
 
   deb:
     needs: test
-    runs-on: ubuntu-latest # amd64: the deb bundles the linux-x64 Node runtime
+    # native runner per arch: the deb bundles that arch's Node runtime, and
+    # the smoke test installs and runs it on the runner
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
@@ -86,6 +99,7 @@ jobs:
         run: bash scripts/build-deb.sh
         env:
           VERSION: ${{ needs.test.outputs.version }}
+          DEB_ARCH: ${{ matrix.arch }}
 
       - name: Smoke-test deb on the runner
         run: |
@@ -136,42 +150,31 @@ jobs:
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
-          name: restreamer-deb
+          name: restreamer-deb-${{ matrix.arch }}
           path: out/*.deb
           if-no-files-found: warn
 
   container:
-    # switcher image -> GHCR. Built locally first, smoke-tested, and only
-    # then pushed (the second build-push step reuses the buildx cache, so it
-    # does not rebuild).
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Compute image name and tags
+      - name: Compute image name
         id: meta
-        run: |
-          # GHCR requires a lowercase repository owner
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/restreamer-switcher"
-          VERSION="${{ needs.test.outputs.version }}"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            # VERSION == package.json version (enforced by the test job)
-            TAGS="$IMAGE:$VERSION,$IMAGE:latest"
-          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            TAGS="$IMAGE:main,$IMAGE:main-$SHORT_SHA"
-          else
-            # workflow_dispatch on a non-main ref: throwaway dev tag
-            TAGS="$IMAGE:dev-$SHORT_SHA"
-          fi
-          {
-            echo "image=$IMAGE"
-            echo "tags=$TAGS"
-          } | tee -a "$GITHUB_OUTPUT"
+        # GHCR requires a lowercase repository owner
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/restreamer-switcher" | tee -a "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -181,16 +184,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # linux/amd64 only for now. To add arm64 later: add
-      # docker/setup-qemu-action before buildx, set
-      # platforms: linux/amd64,linux/arm64 on the PUSH step only (load: true
-      # is single-platform — keep the smoke build/run amd64).
       - name: Build image (local, for smoke test)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/switcher.Dockerfile
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           load: true
           push: false
           tags: restreamer-switcher:smoke
@@ -224,17 +223,75 @@ jobs:
           fi
           docker rm -f switcher-smoke
 
-      - name: Push image
+      - name: Push image by digest
+        id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: deploy/switcher.Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: switcher-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  container-manifest:
+    # tag the per-arch digests from the container job as one multi-arch image
+    needs: [test, container]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: switcher-digest-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          set -euxo pipefail
+          # GHCR requires a lowercase repository owner
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/restreamer-switcher"
+          VERSION="${{ needs.test.outputs.version }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # VERSION == package.json version (enforced by the test job)
+            TAGS=("$IMAGE:$VERSION" "$IMAGE:latest")
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            TAGS=("$IMAGE:main" "$IMAGE:main-$SHORT_SHA")
+          else
+            # workflow_dispatch on a non-main ref: throwaway dev tag
+            TAGS=("$IMAGE:dev-$SHORT_SHA")
+          fi
+
+          args=()
+          for tag in "${TAGS[@]}"; do args+=(-t "$tag"); done
+          for digest in /tmp/digests/*; do args+=("$IMAGE@sha256:$(basename "$digest")"); done
+          docker buildx imagetools create "${args[@]}"
+          docker buildx imagetools inspect "${TAGS[0]}"
 
   release:
-    # proper release: attach the deb to the GitHub release for the tag
+    # proper release: attach the debs to the GitHub release for the tag
     if: startsWith(github.ref, 'refs/tags/v')
     needs: deb
     runs-on: ubuntu-latest
@@ -243,7 +300,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: restreamer-deb
+          pattern: restreamer-deb-*
+          merge-multiple: true
           path: out
       - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
@@ -264,7 +322,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
-          name: restreamer-deb
+          pattern: restreamer-deb-*
+          merge-multiple: true
           path: out
       - name: Drop previous rolling release
         run: gh release delete main-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
