@@ -358,6 +358,7 @@ export class Supervisor {
           configHash: entry.configHash,
           restarts: 0,
           consecutiveFailures: 0,
+          tsErrors: 0,
           lastError: entry.invalidError,
         });
       }

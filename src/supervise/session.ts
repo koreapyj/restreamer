@@ -89,6 +89,15 @@ const SIGKILL_AFTER_MS = 5_000;
 
 export const DEFAULT_WATCHED_PLAYLIST = '1080p/stream.m3u8';
 
+/**
+ * One corrupt input TS packet as reported by ffmpeg's demuxer. The follow-up
+ * `[in#0/mpegts @ …] corrupt input packet in stream N` line describes the
+ * same packet and is deliberately not matched.
+ */
+const TS_ERROR_LINE = /\[mpegts @ [^\]]+\] Packet corrupt \(stream = /;
+/** ffmpeg's log-repeat collapse: applies to the line logged just before it */
+const LAST_MESSAGE_REPEATED = /^\s*Last message repeated (\d+) times?/;
+
 interface Generation {
   abort: AbortController;
   body?: Readable;
@@ -102,6 +111,8 @@ interface Generation {
   /** watchdog-assigned class overriding exit classification */
   pendingClass?: ExitClass;
   lastStderr?: string;
+  /** previous ffmpeg stderr line was a TS error (for "Last message repeated N times") */
+  lastFfmpegLineTsError: boolean;
   exitedTsreadex: boolean;
   exitedFfmpeg: boolean;
   ffmpegExit?: { code: number | null; signal: string | null };
@@ -183,6 +194,8 @@ export class Session {
   private memoryRssMb: number | undefined;
   private lastSegmentAt: string | undefined;
   private playlistLagSec: number | undefined;
+  /** cumulative corrupt-TS-packet count over this Session object's lifetime (survives generations) */
+  private tsErrors = 0;
   /** PAT-probed program number — kept across restarts until a new probe result */
   private detectedProgramNumber: number | undefined;
   /** aborts an in-flight PAT probe (stop() must not wait out the probe timeout) */
@@ -292,6 +305,7 @@ export class Session {
       memoryRssMb: this.memoryRssMb,
       lastSegmentAt: this.lastSegmentAt,
       playlistLagSec: this.playlistLagSec,
+      tsErrors: this.tsErrors,
       detectedProgramNumber: this.detectedProgramNumber,
     };
   }
@@ -361,6 +375,7 @@ export class Session {
       startedAtIso: this.iso(),
       producedProgress: false,
       sourceEnded: false,
+      lastFfmpegLineTsError: false,
       exitedTsreadex: false,
       exitedFfmpeg: false,
       stopping: false,
@@ -563,10 +578,25 @@ export class Session {
   private hookStderr(gen: Generation, stream: Readable, src: 'ffmpeg' | 'tsreadex'): void {
     this.onLines(stream, (line) => {
       gen.lastStderr = line;
+      if (src === 'ffmpeg') this.countTsError(gen, line);
       const entry: LogEntry = { ts: this.iso(), src, line };
       this.logRing.push(entry);
       for (const sub of this.logListeners) sub.onLine(entry);
     });
+  }
+
+  /** `tsErrors` += 1 per corrupt-packet line, += N for a "repeated N times" line right after one */
+  private countTsError(gen: Generation, line: string): void {
+    if (TS_ERROR_LINE.test(line)) {
+      this.tsErrors++;
+      gen.lastFfmpegLineTsError = true;
+      return;
+    }
+    const repeated = LAST_MESSAGE_REPEATED.exec(line);
+    if (repeated && gen.lastFfmpegLineTsError) {
+      this.tsErrors += Number(repeated[1]);
+    }
+    gen.lastFfmpegLineTsError = false;
   }
 
   /** ffmpeg `-progress pipe:3`: key=value lines, block ends at `progress=continue|end`. */

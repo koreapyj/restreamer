@@ -270,10 +270,18 @@ describe('StatusResponse / SessionStatus additions', () => {
       configHash: 'deadbeef',
       restarts: 0,
       consecutiveFailures: 0,
+      tsErrors: 0,
       detectedProgramNumber: 333,
     };
     expect(Value.Check(SessionStatus, session)).toBe(true);
     expect(Value.Check(StatusResponse, { ...statusDoc(), sessions: [session] })).toBe(true);
+  });
+
+  it('requires a non-negative-integer-typed tsErrors on a session status', () => {
+    const base = { name: 'at-x', state: 'running', enabled: true, configHash: 'deadbeef', restarts: 0, consecutiveFailures: 0 };
+    expect(Value.Check(SessionStatus, base)).toBe(false);
+    expect(Value.Check(SessionStatus, { ...base, tsErrors: 1.5 })).toBe(false);
+    expect(Value.Check(SessionStatus, { ...base, tsErrors: 7 })).toBe(true);
   });
 
   it('accepts pendingRemovals with and without error, and rejects a bad name', () => {

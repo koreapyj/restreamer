@@ -226,6 +226,13 @@ export const SessionStatus = Type.Object({
   /** wall-clock lag of the media playlist — the truthful per-session health signal */
   playlistLagSec: Type.Optional(Type.Number()),
   /**
+   * cumulative count of corrupt input TS packets (ffmpeg `[mpegts] Packet
+   * corrupt` lines) over this Session object's lifetime — survives process
+   * generations, restarts from 0 when the Session is replaced or the daemon
+   * restarts. Consumers diff successive samples.
+   */
+  tsErrors: Type.Integer(),
+  /**
    * PAT-probed program number for the current source. Absent when an explicit
    * `programNumber` was supplied or the probe hasn't succeeded yet.
    */

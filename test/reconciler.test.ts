@@ -82,6 +82,7 @@ class FakeSession {
       configHash: this.init.configHash,
       restarts: 0,
       consecutiveFailures: 0,
+      tsErrors: 0,
     };
   }
 }

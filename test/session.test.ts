@@ -107,6 +107,48 @@ describe('Session start → running', () => {
     expect(lines[1]).toMatchObject({ src: 'tsreadex', line: 'pat rewritten' });
   });
 
+  it('counts ffmpeg "Packet corrupt" lines as tsErrors, not the follow-up line or tsreadex output', async () => {
+    const { session, spawn } = makeSession();
+    expect(session.status().tsErrors).toBe(0);
+    await session.start();
+
+    spawn.ffmpeg().writeStderr('[mpegts @ 0x5a0480159d00] Packet corrupt (stream = 1, dts = 5191907334).');
+    spawn.ffmpeg().writeStderr('[in#0/mpegts @ 0x5a0480159bc0] corrupt input packet in stream 1');
+    spawn.ffmpeg().writeStderr('[aac @ 0x1] channel element 0.0 is not allocated');
+    spawn.tsreadex().writeStderr('[mpegts @ 0x1] Packet corrupt (stream = 0, dts = 1).');
+    await flush();
+
+    expect(session.status().tsErrors).toBe(1);
+  });
+
+  it('adds N for "Last message repeated N times" only right after a TS error line', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+
+    spawn.ffmpeg().writeStderr('[mpegts @ 0x1] Packet corrupt (stream = 1, dts = 10).');
+    spawn.ffmpeg().writeStderr('    Last message repeated 4 times');
+    spawn.ffmpeg().writeStderr('[aac @ 0x1] Reserved bit set.');
+    spawn.ffmpeg().writeStderr('    Last message repeated 7 times');
+    await flush();
+
+    expect(session.status().tsErrors).toBe(5);
+  });
+
+  it('keeps the tsErrors total across a crash restart within the same Session object', async () => {
+    const { session, spawn } = makeSession();
+    await session.start();
+    spawn.ffmpeg().writeStderr('[mpegts @ 0x1] Packet corrupt (stream = 1, dts = 10).');
+    await flush();
+    spawn.ffmpeg().exit(1);
+    await vi.advanceTimersByTimeAsync(2_001);
+    await flush();
+    expect(session.state).toBe('running');
+
+    spawn.ffmpeg().writeStderr('[mpegts @ 0x2] Packet corrupt (stream = 0, dts = 20).');
+    await flush();
+    expect(session.status().tsErrors).toBe(2);
+  });
+
   it('never spawns anything for a disabled session and reports disabled', async () => {
     const { session, spawn, source } = makeSession({ desired: { enabled: false } });
     await session.start();
